@@ -10,14 +10,14 @@ on:
 
 jobs:
   testpypi-publish:
-    if: github.repository == 'LightwaveSmartHome/lightwave-smart'
+    if: github.repository == 'LightwaveSmartHome/lightwave_smart'
     
     runs-on: ubuntu-latest
 
     name: Upload release to TestPyPI
     environment:
       name: testpypi
-      url: https://test.pypi.org/p/lightwave-smart
+      url: https://test.pypi.org/p/lightwave_smart
     permissions:
       id-token: write
 
@@ -35,5 +35,4 @@ jobs:
       run: python -m build
     - name: Publish package distributions to TestPyPI
       uses: pypa/gh-action-pypi-publish@release/v1
-      with:
-        repository-url: https://test.pypi.org/legacy/
+  

@@ -4,17 +4,17 @@ with open("README.md", "r") as fh:
     long_description = fh.read()
 
 setuptools.setup(
-    name="lightwave2",
-    version="0.8.23",
-    author="Bryan Blunt",
-    author_email="bryan@blunt.me.uk",
-    description="Controls for Lightwave RF second generation devices",
+    name="lightwave_smart",
+    version="0.8.24",
+    author="Bryan Blunt / Lightwave",
+    author_email="dev@lightwaverf.com",
+    description="Controls for Lightwave Smart Series (second generation) devices",
     install_requires=[
         "aiohttp<=4",
     ],
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/bigbadblunt/lightwave2",
+    url="https://github.com/LightwaveSmartHome/lightwave_smart",
     packages=setuptools.find_packages(),
     classifiers=[
         "Programming Language :: Python :: 3",

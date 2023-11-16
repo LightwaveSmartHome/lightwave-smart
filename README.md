@@ -1,4 +1,4 @@
-Python library to provide a reliable communication link with LightWaveRF second generation lights and switches.
+Python library to provide a reliable communication link with Lightwave Smart Series (second generation) lights and switches.
 
 **Note that in verion 0.8.0+ the architecture has changed. Features are no longer a (id, value) tuple, but instead are now instances of LWRFFeature objects, with id and state properties.**
 
@@ -8,16 +8,16 @@ Python library to provide a reliable communication link with LightWaveRF second 
 
 The easiest way is 
 
-    pip3 install lightwave2
+    pip3 install lightwave_smart
 
-Or just copy https://raw.githubusercontent.com/bigbadblunt/lightwave2/master/lightwave2/lightwave2.py into your project
+Or just copy https://raw.githubusercontent.com/LightwaveSmartHome/lightwave-smart/master/lightwave_smart/lightwave_smart.py into your project
 
 ## Using the library
 
 ### Imports
 You'll need to import the library
 
-    from lightwave2 import lightwave2
+    from lightwave_smart import lightwave_smart
 
 If you want to see all the messages passed back and forth with the Lightwave servers, set the logging level to debug:
 
@@ -27,7 +27,7 @@ If you want to see all the messages passed back and forth with the Lightwave ser
 ### Connecting
 Start by authenticating with the LW servers.
 
-    link = lightwave2.LWLink2("example@example.com", "password")
+    link = lightwave_smart.LWLink2("example@example.com", "password")
     
 This sets up a `LWLink2` object called `link`, and gets an authentication token from LW which is stored in the object. We can now connect to the LW websocket service    
         
@@ -53,7 +53,7 @@ For a slightly more useful view:
 
 In my case this returns
 
-    Garden Room 5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e {'switch': <lightwave2.lightwave2.LWRFFeature object at 0x0000021DB49C93A0>, 'protection': <lightwave2.lightwave2.LWRFFeature object at 0x0000021DB49C9AC0>, 'dimLevel': <lightwave2.lightwave2.LWRFFeature object at 0x0000021DB49C9B50>, 'identify': <lightwave2.lightwave2.LWRFFeature object at 0x0000021DB49C9BB0>}
+    Garden Room 5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e {'switch': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C93A0>, 'protection': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C9AC0>, 'dimLevel': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C9B50>, 'identify': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C9BB0>}
 
 This is a light switch with the name `Garden Room` and the featureset id `5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e` which we'll use in the example. The features will be explained below.
 

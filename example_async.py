@@ -1,4 +1,4 @@
-from lightwave2 import lightwave2
+from lightwave_smart import lightwave_smart
 import logging
 import asyncio
 
@@ -19,7 +19,7 @@ async def main():
     #Following three lines are minimal requirement to initialise a connection
     #This will start up a background consumer_handler task that will run as long as the event loop is active
     #This will keep the states synchronised with the real world, and reconnect if the connection drops
-    link = lightwave2.LWLink2(user, password)
+    link = lightwave_smart.LWLink2(user, password)
     await link.async_connect()
     await link.async_get_hierarchy()
 

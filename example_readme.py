@@ -1,4 +1,4 @@
-from lightwave2 import lightwave2
+from lightwave_smart import lightwave_smart
 import logging
 logging.basicConfig(level=logging.DEBUG)
 
@@ -8,7 +8,7 @@ user = USER if USER else input("Enter username: ")
 password = PASSWORD if PASSWORD else input("Enter password: ")
 
 EXAMPLE_FEATURESET = '5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'
-link = lightwave2.LWLink2(user, password)
+link = lightwave_smart.LWLink2(user, password)
 link.connect()
 link.get_hierarchy()
 print(link.featuresets)

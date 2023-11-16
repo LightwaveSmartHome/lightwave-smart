@@ -10,7 +10,7 @@ on:
 
 jobs:
   testpypi-publish:
-    if: github.repository == 'LightwaveSmartHome/lightwave_smart'
+    if: github.repository == 'LightwaveSmartHome/lightwave-smart'
     
     runs-on: ubuntu-latest
 

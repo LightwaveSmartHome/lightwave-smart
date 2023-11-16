@@ -186,3 +186,7 @@ The library is actually all built on  async methods (the sync versions described
     async_turn_off_by_featureset_id(featureset_id)
     async_set_brightness_by_featureset_id(featureset_id, level)
     async_set_temperature_by_featureset_id(featureset_id, level)
+
+## Thanks
+
+Credit to Bryan Blunt for the original version https://github.com/bigbadblunt/lightwave2

@@ -1,8 +1,7 @@
-Python library to provide a reliable communication link with Lightwave Smart Series (second generation) lights and switches.
+Python library to provide reliable communication with Lightwave Smart Series (second generation) lights and switches.
 
-**Note that in verion 0.8.0+ the architecture has changed. Features are no longer a (id, value) tuple, but instead are now instances of LWRFFeature objects, with id and state properties.**
-
-**In version 0.8.0+ get_featureset_by_id has been removed. Use link.featuresets[feature_id] instead**
+## Notes
+**The LWLink2Public class should not be used in this version, it has not been tested.**
 
 ## Installing
 
@@ -175,7 +174,7 @@ See example_async.py for a minimal client.
 
 #### async methods
 
-The library is actually all built on  async methods (the sync versions described above are just wrappers for the async versions)
+The library is actually all built on async methods (the sync versions described above are just wrappers for the async versions)
 
     async_connect()
     async_get_hierarchy()

@@ -1,4 +1,4 @@
-Python library to provide reliable communication with Lightwave Smart Series (second generation) lights and switches.
+Python library to provide reliable communication with Lightwave Smart Series (second generation) devices.  Including lights (dimmers), power outlets (sockets), smart switchs (wirefrees), PIRs, thermostats, TRVs, magnetic switches, relays, energy monitors and other device types.
 
 ## Notes
 **The LWLink2Public class should not be used in this version, it has not been tested.**

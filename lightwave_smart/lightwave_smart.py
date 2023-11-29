@@ -125,11 +125,15 @@ class LWRFFeatureSet:
     def is_windowsensor(self): return self.has_feature('windowPosition')
     def is_motionsensor(self): return self.has_feature('movement')
     def is_hub(self): return self.has_feature('buttonPress')
+    def is_remote(self): return (self.has_feature('uiButton') or self.has_feature('uiButtonPair')) and self.has_feature('batteryLevel')
 
     def is_gen2(self): return (self.has_feature('upgrade') or self.has_feature('uiButton') or self.is_hub())
     def reports_power(self): return self.has_feature('power')
     def has_led(self): return self.has_feature('rgbColor') and not self.virtual_product_code
     def has_uiIndicator(self): return self.has_feature('uiIndicator')
+    
+    def is_uiButtonPair_producer(self): return (self.has_feature('uiButtonPair') and (self.is_remote() or self.is_light()))
+    def is_uiButton_producer(self): return (self.has_feature('uiButton') and not self.is_uiButtonPair_producer())
 
     def get_feature_by_type(self, type):
         feature = None
@@ -245,17 +249,42 @@ class LWRFUiIOMapFeature(LWRFFeature, UiIOMapEncoderDecoder):
 
     def update_feature_state(self, state):
         super().update_feature_state(state)
-        
-        names = self.get_feature_set_names()
-
         if (self._state):
             mapping = self.decode_io_mapping_value(self._state, self._channel_count, self.channel_zero_position)
             self.channel_input_mapped = bool(mapping["inputs"][self._channel])
         
-            _LOGGER.debug("LWRFUiIOMapFeature: %s - %s - %s - %s - %s ", names, self._channel_count, self._channel, self.channel_zero_position, self.channel_input_mapped)
-
             # _in = self.get_ui_io_data(mapping["inputs"], self._channel_count)
             # _out = self.get_ui_io_data(mapping["outputs"], self._channel_count)
+
+class UiButtonEncoderDecoder:
+    def decode_ui_button_value(self, value, type):
+        decoded_obj = {}
+
+        if type == 'uiButtonPair':
+            decoded_obj['upDown'] = 'Up' if (value & 0xf000) >> 12 == 0 else 'Down'
+
+        press = (value & 0x0f00) >> 8
+        if press == 1:
+            decoded_obj['eventType'] = 'Short'
+        elif press == 2:
+            decoded_obj['eventType'] = 'Long'
+        elif press == 3:
+            decoded_obj['eventType'] = 'Long-Release'
+
+        decoded_obj['presses'] = value & 0x00ff
+
+        return decoded_obj
+
+class LWRFUiButtonFeature(LWRFFeature, UiButtonEncoderDecoder):
+
+    def __init__(self, id, name, link):
+        super().__init__(id, name, link)
+        self.decoded_obj = {}
+
+    def update_feature_state(self, state):
+        super().update_feature_state(state)
+        if (self._state):
+            self.decoded_obj = self.decode_ui_button_value(self._state, self.name)
 
 
 class LWWebsocket:
@@ -544,30 +573,32 @@ class LWLink2:
 
     async def _feature_event_handler(self, message):
         _LOGGER.debug("_feature_event_handler: Event received - items: %s ", len(message["items"]))
+        
+        items = message["items"]
+        for item in items:
+            if "featureId" in item["payload"]:
+                feature_id = item["payload"]["featureId"]
+                value = item["payload"]["value"]
 
-        if "featureId" in message["items"][0]["payload"]:
-            feature_id = message["items"][0]["payload"]["featureId"]
-            value = message["items"][0]["payload"]["value"]
-
-            # feature = self.get_feature_by_featureid(feature_id)
-            feature = None
-            if feature_id in self.features:
-                feature = self.features[feature_id]
-            
-            if feature is None:
-                _LOGGER.debug("_feature_event_handler: feature is None: %s)", feature_id)
-            else:
-                prev_value = feature.state
+                # feature = self.get_feature_by_featureid(feature_id)
+                feature = None
+                if feature_id in self.features:
+                    feature = self.features[feature_id]
                 
-                feature.update_feature_state(value)
+                if feature is None:
+                    _LOGGER.warning("_feature_event_handler: feature is None: %s", feature_id)
+                else:
+                    prev_value = feature.state
+                    
+                    feature.update_feature_state(value)
 
-                #  call any callbacks registered for this featues featureSet
-                for feature_set in feature.feature_sets:
-                    if feature_set.featureset_id in self._feature_set_event_callbacks:
-                        for func in self._feature_set_event_callbacks[feature_set.featureset_id]:
-                            func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
-            
-            return feature
+                    #  call any callbacks registered for this featues featureSet
+                    for feature_set in feature.feature_sets:
+                        if feature_set.featureset_id in self._feature_set_event_callbacks:
+                            for func in self._feature_set_event_callbacks[feature_set.featureset_id]:
+                                func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+                
+                return feature
 
 
     async def async_get_hierarchy(self):
@@ -653,11 +684,9 @@ class LWLink2:
         readmess.additem(readitem)
         return await self._ws._async_sendmessage(readmess)
 
-    def get_featureset_by_featureid(self, feature_id):
-        for x in self.featuresets.values():
-            for y in x.features.values():
-                if y.id == feature_id:
-                    return x
+    def get_featuresets_by_featureid(self, feature_id):
+        if feature_id in self.features:
+            return self.features[feature_id].feature_sets
         return None
 
     def get_feature_by_featureid(self, feature_id):
@@ -712,6 +741,15 @@ class LWLink2:
     
     def get_lights(self):
         return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_light()]
+
+    def get_remotes(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_remote()]
+
+    def get_uiButtonPair_producers(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_uiButtonPair_producer()]
+
+    def get_uiButton_producers(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_uiButton_producer()]
 
     def get_climates(self):
         return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_climate()]
@@ -840,6 +878,10 @@ class LWLink2:
                                 count += 1
 
                         feature = LWRFUiIOMapFeature(feature_id, _lw_Feature, self, count)
+                        
+                    elif featureType == "uiButton" or featureType == "uiButtonPair":
+                        feature = LWRFUiButtonFeature(feature_id, _lw_Feature, self)
+                        
                     else:
                         feature = LWRFFeature(feature_id, _lw_Feature, self)
 

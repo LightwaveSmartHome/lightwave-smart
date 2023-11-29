@@ -6,11 +6,14 @@ import aiohttp
 
 import logging
 
+from .products import get_product
+
+
 _LOGGER = logging.getLogger(__name__)
 
 AUTH_SERVER = "https://auth.lightwaverf.com/v2/lightwaverf/autouserlogin/lwapps"
 TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
-VERSION = "1.6.8"
+VERSION = "1.6.9"
 MAX_RETRIES = 5
 PUBLIC_AUTH_SERVER = "https://auth.lightwaverf.com/token"
 PUBLIC_API = "https://publicapi.lightwaverf.com/v1/"
@@ -22,15 +25,62 @@ class _LWRFWebsocketMessage:
     _tran_id = 0
     _sender_id = str(uuid.uuid4())
 
-    def __init__(self, opclass, operation):
-        self._message = {"class": opclass, "operation": operation, "version": 1, "senderId": self._sender_id,
-                         "transactionId": _LWRFWebsocketMessage._tran_id}
+    def __init__(self, opclass, operation, item_received_cb=None):
         _LWRFWebsocketMessage._tran_id += 1
-        self._message["direction"] = "request"
+        self.transcation_id = _LWRFWebsocketMessage._tran_id
+        self.opclass = opclass
+        self.operation = operation
+        self.item_received_cb = item_received_cb
+        
+        self.pending_item_ids = []
+        self.item_responses = []
+
+        self._waitflag = None
+        self._message = {
+            "direction": "request",
+            "class": opclass, 
+            "operation": operation, 
+            "version": 1, 
+            "senderId": self._sender_id,
+            "transactionId": _LWRFWebsocketMessage._tran_id
+        }
         self._message["items"] = []
 
     def additem(self, newitem):
+        self.pending_item_ids.append(newitem._item["itemId"])
         self._message["items"].append(newitem._item)
+        return newitem._item["itemId"]
+
+    def add_item_responses(self, message):
+        items = message["items"]
+        for item in items:
+            self.item_responses.append(item)
+            if self.item_received_cb:
+                self.item_received_cb(item)
+            idx = self.pending_item_ids.index(item["itemId"])
+            if idx is not None:
+                self.pending_item_ids.pop(idx)
+            # else:
+            #     # TODO - problem?
+
+        return len(self.pending_item_ids)
+
+    def set_item_received_cb(self, item_received_cb):
+        self.item_received_cb = item_received_cb        
+
+    def get_items(self):
+        return self._message["items"]
+    
+    def get_item_responses(self):
+        return self.item_responses
+    
+    def send_items(self):
+        self._waitflag = asyncio.Event()
+        self._waitflag.clear()
+        return self._waitflag
+    
+    def set_waitflag(self):
+        return self._waitflag.set()
 
     def json(self):
         return json.dumps(self._message)
@@ -39,25 +89,34 @@ class _LWRFWebsocketMessageItem:
     _item_id = 0
 
     def __init__(self, payload=None):
+        _LWRFWebsocketMessageItem._item_id += 1
         if payload is None:
             payload = {}
-        self._item = {"itemId": _LWRFWebsocketMessageItem._item_id}
-        _LWRFWebsocketMessageItem._item_id += 1
-        self._item["payload"] = payload
+        self._item = {
+            "itemId": _LWRFWebsocketMessageItem._item_id,
+            "payload": payload
+        }
 
 
 class LWRFFeatureSet:
 
     def __init__(self):
         self.link = None
+
         self.featureset_id = None
         self.name = None
         self.product_code = None
+        self.virtual_product_code = None
+        self.firmware_version = None
+        self.manufacturer_code = None
+        self.serial = None
+
         self.features = {}
 
     def has_feature(self, feature): return feature in self.features.keys()
 
-    def is_switch(self): return (self.has_feature('switch')) and not (self.has_feature('dimLevel'))
+    def is_switch(self): return (self.has_feature('switch')) and not (self.has_feature('dimLevel')) and not (self.has_feature('socketSetup'))
+    def is_outlet(self): return self.has_feature('socketSetup')
     def is_light(self): return self.has_feature('dimLevel')
     def is_climate(self): return self.has_feature('targetTemperature')
     def is_trv(self): return self.has_feature('valveSetup')
@@ -69,28 +128,140 @@ class LWRFFeatureSet:
 
     def is_gen2(self): return (self.has_feature('upgrade') or self.has_feature('uiButton') or self.is_hub())
     def reports_power(self): return self.has_feature('power')
-    def has_led(self): return self.has_feature('rgbColor')
+    def has_led(self): return self.has_feature('rgbColor') and not self.virtual_product_code
+    def has_uiIndicator(self): return self.has_feature('uiIndicator')
+
+    def get_feature_by_type(self, type):
+        feature = None
+        if type in self.features:
+            feature = self.features[type]
+        return feature
 
 class LWRFFeature:
 
-    def __init__(self):
-        self.featureset = None
-        self.id = None
-        self.name = None
+    def __init__(self, id, lw_feature, link):
+        self.id = id
+        self.lw_feature = lw_feature
+        self.name = lw_feature["attributes"]["type"]
+        self.link = link
+        
+        self.feature_sets = []
         self._state = None
+
+
+    def add_feature_set(self, feature_set):
+        self.feature_sets.append(feature_set)
+
+    def get_feature_set_names(self):
+        names = ""
+        for fs in self.feature_sets:
+            if len(names) > 0:
+                names += ", "
+            names += fs.name
+        return names
+    
+    def get_feature_set_product_code(self):
+        fs = self.feature_sets[0]
+        return fs.product_code
+        
 
     @property
     def state(self):
         return self._state
 
     async def set_state(self, value):
-        await self.featureset.link.async_write_feature(self.id, value)
+        await self.link.async_write_feature(self.id, value)
 
-class LWLink2:
+    def update_feature_state(self, state):
+        self._state = state
+
+    async def async_read_feature_state(self):
+        responses = await self.link.async_read_feature(self.id)
+
+        if responses[0]["success"] == True:
+            state = responses[0]["payload"]["value"]
+            self.update_feature_state(state)
+        else:
+            _LOGGER.warning("update_feature_state: failed to read feature ({}), returned {}".format(self.id, responses))
+
+
+class UiIOMapEncoderDecoder:
+    def _encode(self, io_mapping):
+        inputs = list(io_mapping["inputs"])
+        input_str = "".join(map(str, inputs)).rjust(8, "0")
+        outputs = list(io_mapping["outputs"])
+        output_str = "".join(map(str, outputs)).rjust(8, "0")
+        io_mapping_bin = f"{output_str}{input_str}".rjust(32, "0")
+        return int(io_mapping_bin, 2)
+
+    def _decode(self, value):
+        bin_str = bin(value)[2:].rjust(32, "0")
+        inputs = list(map(int, bin_str[24:32]))
+        outputs = list(map(int, bin_str[16:24]))
+        return {"inputs": inputs, "outputs": outputs}  
+
+    def decode_io_mapping_value(self, value, channel_count, channel_zero_position):
+        #  left order of channels as given by uiIOMap feature
+        decoded = self._decode(value)
+        reversed_channels = channel_zero_position != 'left'
+
+        inputs = decoded['inputs'][-channel_count:]
+        outputs = decoded['outputs'][-channel_count:]
+        if reversed_channels:
+            inputs.reverse()
+            outputs.reverse()
+        return { 'inputs': inputs, 'outputs': outputs }
+    
+    # def get_ui_io_data(self, array, channel_count, reversed_channels):
+    def get_ui_io_data(self, array, channel_count):
+        return [
+            {
+                'index': index,
+                'channelNumber': index + 1 if False else channel_count - index,
+                # 'channelNumber': index + 1 if reversed_channels else self.channel_count - index,
+                'selected': bool(value)
+            }
+            for index, value in enumerate(array)
+        ]    
+
+class LWRFUiIOMapFeature(LWRFFeature, UiIOMapEncoderDecoder):
+
+    def __init__(self, id, name, link, channel_count):
+        super().__init__(id, name, link)
+        self._channel = self.lw_feature["attributes"]["channel"]
+        self._channel_count = channel_count
+
+        self.channel_zero_position = "right"
+        self.channel_input_mapped = True
+
+    def add_feature_set(self, feature_set):
+        super().add_feature_set(feature_set)
+
+        product_code = self.get_feature_set_product_code()
+        product_details = get_product(product_code)
+        if product_details:
+            if "channel_zero_position" in product_details:
+                self.channel_zero_position = product_details["channel_zero_position"]
+
+    def update_feature_state(self, state):
+        super().update_feature_state(state)
+        
+        names = self.get_feature_set_names()
+
+        if (self._state):
+            mapping = self.decode_io_mapping_value(self._state, self._channel_count, self.channel_zero_position)
+            self.channel_input_mapped = bool(mapping["inputs"][self._channel])
+        
+            _LOGGER.debug("LWRFUiIOMapFeature: %s - %s - %s - %s - %s ", names, self._channel_count, self._channel, self.channel_zero_position, self.channel_input_mapped)
+
+            # _in = self.get_ui_io_data(mapping["inputs"], self._channel_count)
+            # _out = self.get_ui_io_data(mapping["outputs"], self._channel_count)
+
+
+class LWWebsocket:
 
     def __init__(self, username=None, password=None, auth_method="username", api_token=None, refresh_token=None, device_id=None):
 
-        self.featuresets = {}
         self._authtoken = None
 
         self._username = username
@@ -103,21 +274,22 @@ class LWLink2:
         self._session = aiohttp.ClientSession()
         self._token_expiry = None
 
-        self._callback = []
+        self._eventHandlers = {}
 
         # Websocket only variables:
         self._device_id = (device_id or "PLW2:") + str(uuid.uuid4())
         self._websocket = None
 
-        self._group_ids = []
-
         # Next two variables are used to synchronise responses to requests
-        self._transactions = {}
-        self._response = None
+        self._pending_transactions = {}
 
-        asyncio.ensure_future(self._consumer_handler())
+        self.background_tasks = set()
 
-    async def _async_sendmessage(self, message, _retry=1, redact = False):
+        task = asyncio.create_task(self._consumer_handler())
+        self.background_tasks.add(task)
+        task.add_done_callback(self.background_tasks.discard)
+
+    async def _async_sendmessage(self, message, _retry = 1, redact = False):
 
         if not self._websocket or self._websocket.closed:
             _LOGGER.info("async_sendmessage: Websocket closed, reconnecting")
@@ -129,31 +301,41 @@ class LWLink2:
         else:
             _LOGGER.debug("async_sendmessage: Sending: %s", message.json())
 
-        await self._websocket.send_str(message.json())
-        _LOGGER.debug("async_sendmessage: Message sent, waiting for acknowledgement from server")
-        waitflag = asyncio.Event()
-        self._transactions[message._message["transactionId"]] = waitflag
-        waitflag.clear()
-        try:
-            await asyncio.wait_for(waitflag.wait(), timeout=5.0)
-            _LOGGER.debug("async_sendmessage: Response received: %s", str(self._response))
-        except asyncio.TimeoutError:
-            _LOGGER.debug("async_sendmessage: Timeout waiting for response to : %s", message._message["transactionId"])
-            self._transactions.pop(message._message["transactionId"])
-            self._response = None
+        transaction_id = message._message["transactionId"]
+        self._pending_transactions[transaction_id] = message
+        waitflag = message.send_items()
 
-        if self._response:
-            return self._response
+        await self._websocket.send_str(message.json())
+        _LOGGER.debug("async_sendmessage: Message sent, waiting for acknowledgement from server: %s ", transaction_id)
+
+        responses = None
+        try:
+            timeout = 60.0 if len(message.get_items()) > 12 else len(message.get_items()) * 5.0
+            await asyncio.wait_for(waitflag.wait(), timeout=timeout)
+            responses = message.get_item_responses()
+            _LOGGER.debug("async_sendmessage: Response received for: %s ", transaction_id)
+        except asyncio.TimeoutError:
+            responses = message.get_item_responses()
+            items = message.get_items()
+            _LOGGER.warning("async_sendmessage: Timeout waiting for responses to: %s (items: %s , responses: %s)  %s - %s", transaction_id, len(items), len(responses), message._message["class"], message._message["operation"])
+            if len(responses) == 0:
+                # retry only possible if no responses received
+                responses = None
+
+        self._pending_transactions.pop(transaction_id)
+
+        if responses:
+            return responses
         elif _retry >= MAX_RETRIES:
             if redact:
-                _LOGGER.warning("Exceeding MAX_RETRIES, abandoning send. Failed message %s", message.json())
+                _LOGGER.warning("async_sendmessage: Exceeding MAX_RETRIES, abandoning send. Failed message %s", message.json())
             else:
-                _LOGGER.warning("Exceeding MAX_RETRIES, abandoning send. Failed message not shown as contains sensitive info")
+                _LOGGER.warning("async_sendmessage: Exceeding MAX_RETRIES, abandoning send. Failed message not shown as contains sensitive info")
             
-            _LOGGER.warning("async_sendmessage: Exceeding MAX_RETRIES, abandoning send. Failed message %s", )
+            _LOGGER.warning("async_sendmessage: Exceeding MAX_RETRIES, abandoning send. Failed tran %s", transaction_id)
             return None
         else:
-            _LOGGER.info("async_sendmessage: Send failed, resending message (attempt %s)", _retry + 1)
+            _LOGGER.info("async_sendmessage: Send failed for tran %s , resending message (attempt %s)", transaction_id, _retry + 1)
             return await self._async_sendmessage(message, _retry + 1, redact)
 
     async def _consumer_handler(self):
@@ -170,197 +352,62 @@ class LWLink2:
             else:
                 if mess.type == aiohttp.WSMsgType.TEXT:
                     message = mess.json()
-                    # Some transaction IDs don't work, this is a workaround
-                    if message["class"] == "feature" and (
-                            message["operation"] == "write" or message["operation"] == "read"):
-                        message["transactionId"] = message["items"][0]["itemId"]
                     # now parse the message
-                    if message["transactionId"] in self._transactions:
-                        _LOGGER.debug("consumer_handler: Response matched for transaction %s", message["transactionId"])
-                        self._response = message
-                        self._transactions[message["transactionId"]].set()
-                        self._transactions.pop(message["transactionId"])
-                    elif message["direction"] == "notification" and message["class"] == "group" \
-                            and message["operation"] == "event":
-                        await self.async_get_hierarchy()
-                    elif message["direction"] == "notification" and message["operation"] == "event":
-                        if "featureId" in message["items"][0]["payload"]:
-                            feature_id = message["items"][0]["payload"]["featureId"]
-                            feature = self.get_feature_by_featureid(feature_id)
-                            value = message["items"][0]["payload"]["value"]
-                            
-                            if feature is None:
-                                _LOGGER.debug("consumer_handler: feature is None: %s)", feature_id)
-                            else:
-                                prev_value = feature.state
+                    if message["transactionId"] in self._pending_transactions:
+                        tran_message = self._pending_transactions[message["transactionId"]]
+                        items_remaining = tran_message.add_item_responses(message)
+                        _LOGGER.debug("consumer_handler: Response for transaction %s - %s - %s - %s ", message["transactionId"], tran_message.opclass, tran_message.operation, items_remaining)
 
-                                feature._state = value
-                                cblist = [c.__name__ for c in self._callback]
-                                _LOGGER.debug("consumer_handler: Event received (%s %s %s), calling callbacks %s", feature_id, feature, value, cblist)
-                                for func in self._callback:
-                                    func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+                        if items_remaining <= 0:
+                            tran_message.set_waitflag()
+
+                    elif message["direction"] == "notification":
+                        if message["operation"] == "event":
+                            if (message["class"] in self._eventHandlers):
+                                _LOGGER.debug("consumer_handler: handling notification event of class: %s ", message["class"])
+                                fns = self._eventHandlers[message["class"]]
+                                
+                                async with asyncio.TaskGroup() as tg:
+                                    for func in fns:
+                                        tg.create_task(func(message))
+
+                            # if "featureId" in message["items"][0]["payload"]:
+                            #     feature_id = message["items"][0]["payload"]["featureId"]
+                            #     feature = self.get_feature_by_featureid(feature_id)
+                            #     value = message["items"][0]["payload"]["value"]
+                                
+                            #     if feature is None:
+                            #         _LOGGER.debug("consumer_handler: feature is None: %s)", feature_id)
+                            #     else:
+                            #         prev_value = feature.state
+
+                            #         feature._state = value
+                            #         cblist = [c.__name__ for c in self._callback]
+                            #         _LOGGER.debug("consumer_handler: Event received (%s %s %s), calling callbacks %s", feature_id, feature, value, cblist)
+                            #         for func in self._callback:
+                            #             func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+                            else:
+                                _LOGGER.warning("consumer_handler: Unhandled event message: %s", message)
                         else:
-                            _LOGGER.warning("consumer_handler: Unhandled event message: %s", message)
+                            _LOGGER.warning("consumer_handler: Received unhandled notification: %s", message)
                     else:
-                        _LOGGER.warning("consumer_handler: Received unhandled message: %s", message)
+                        _LOGGER.warning("consumer_handler: Received unhandled message: %s - %s - %s", message["transactionId"], message["class"], message["operation"])
                 elif mess.type == aiohttp.WSMsgType.CLOSED:
                     # We're not going to get a response, so clear response flag to allow _send_message to unblock
                     _LOGGER.info("consumer_handler: Websocket closed in message handler")
-                    self._response = None
                     self._websocket = None
-                    for key, flag in self._transactions.items():
-                        flag.set()
-                    self._transactions = {}
+                    for key, tran_message in self._pending_transactions.items():
+                        tran_message.set_waitflag()
+                    self._pending_transactions = {}
                     #self._authtoken = None
                     asyncio.ensure_future(self.async_connect())
                     _LOGGER.info("consumer_handler: Websocket reconnect requested by message handler")
 
-    async def async_register_callback(self, callback):
-        _LOGGER.debug("async_register_callback: Register callback '%s'", callback.__name__)
-        self._callback.append(callback)
+    def register_event_handler(self, eventClass, callback):
+        if (eventClass not in self._eventHandlers):
+            self._eventHandlers[eventClass] = []
+        self._eventHandlers[eventClass].append(callback)
 
-    async def async_get_hierarchy(self):
-        _LOGGER.debug("async_get_hierarchy: Reading hierarchy")
-        readmess = _LWRFWebsocketMessage("user", "rootGroups")
-        readitem = _LWRFWebsocketMessageItem()
-        readmess.additem(readitem)
-        response = await self._async_sendmessage(readmess)
-
-        self._group_ids = []
-        for item in response["items"]:
-            self._group_ids = self._group_ids + item["payload"]["groupIds"]
-
-        _LOGGER.debug("async_get_hierarchy: Reading groups {}".format(self._group_ids))
-        await self._async_read_groups()
-
-        await self.async_update_featureset_states()
-
-    async def _async_read_groups(self):
-        self.featuresets = {}
-        for groupId in self._group_ids:
-            readmess = _LWRFWebsocketMessage("group", "hierarchy")
-            readitem = _LWRFWebsocketMessageItem({"groupId": groupId})
-
-            readmess.additem(readitem)
-            hierarchy_response = await self._async_sendmessage(readmess)
-
-            readmess2 = _LWRFWebsocketMessage("group", "read")
-            readitem2 = _LWRFWebsocketMessageItem({"groupId": groupId,
-                                         "devices": True,
-                                         "features": True,
-                                        #  "automations": True,
-                                         "subgroups": True,
-                                         "subgroupDepth": 10
-                                         })
-            
-            readmess2.additem(readitem2)
-            group_read_response = await self._async_sendmessage(readmess2)
-
-            devices = list(group_read_response["items"][0]["payload"]["devices"].values())
-            features = list(group_read_response["items"][0]["payload"]["features"].values())
-
-            featuresets = list(hierarchy_response["items"][0]["payload"]["featureSet"])
-            
-            self.get_featuresets(featuresets, devices, features)
-
-    async def async_update_featureset_states(self):
-        for x in self.featuresets.values():
-            for y in x.features.values():
-                value = await self.async_read_feature(y.id)
-                if value["items"][0]["success"] == True:
-                    y._state = value["items"][0]["payload"]["value"]
-                else:
-                    _LOGGER.warning("update_featureset_states: failed to read feature ({}), returned {}".format(y.id, value))
-
-    async def async_write_feature(self, feature_id, value):
-        readmess = _LWRFWebsocketMessage("feature", "write")
-        readitem = _LWRFWebsocketMessageItem({"featureId": feature_id, "value": value})
-        readmess.additem(readitem)
-        await self._async_sendmessage(readmess)
-
-    async def async_write_feature_by_name(self, featureset_id, featurename, value):
-        await self.featuresets[featureset_id].features[featurename].set_state(value)
-
-    async def async_read_feature(self, feature_id):
-        readmess = _LWRFWebsocketMessage("feature", "read")
-        readitem = _LWRFWebsocketMessageItem({"featureId": feature_id})
-        readmess.additem(readitem)
-        return await self._async_sendmessage(readmess)
-
-    def get_featureset_by_featureid(self, feature_id):
-        for x in self.featuresets.values():
-            for y in x.features.values():
-                if y.id == feature_id:
-                    return x
-        return None
-
-    def get_feature_by_featureid(self, feature_id):
-        for x in self.featuresets.values():
-            for y in x.features.values():
-                if y.id == feature_id:
-                    return y
-        return None
-
-    async def async_turn_on_by_featureset_id(self, featureset_id):
-        await self.async_write_feature_by_name(featureset_id, "switch", 1)
-
-    async def async_turn_off_by_featureset_id(self, featureset_id):
-        await self.async_write_feature_by_name(featureset_id, "switch", 0)
-
-    async def async_set_brightness_by_featureset_id(self, featureset_id, level):
-        await self.async_write_feature_by_name(featureset_id, "dimLevel", level)
-
-    async def async_set_temperature_by_featureset_id(self, featureset_id, level):
-        await self.async_write_feature_by_name(featureset_id, "targetTemperature", int(level * 10))
-
-    async def async_set_valvelevel_by_featureset_id(self, featureset_id, level):
-        await self.async_write_feature_by_name(featureset_id, "valveLevel", int(level * 20))
-
-    async def async_cover_open_by_featureset_id(self, featureset_id):
-        await self.async_write_feature_by_name(featureset_id, "threeWayRelay", 1)
-
-    async def async_cover_close_by_featureset_id(self, featureset_id):
-        await self.async_write_feature_by_name(featureset_id, "threeWayRelay", 2)
-
-    async def async_cover_stop_by_featureset_id(self, featureset_id):
-        await self.async_write_feature_by_name(featureset_id, "threeWayRelay", 0)
-
-    async def async_set_led_rgb_by_featureset_id(self, featureset_id, color):
-        red = (color & int("0xFF0000", 16)) >> 16
-        if red != 0:
-            red = min(max(red, RGB_FLOOR), 255)
-        green = (color & int("0xFF00", 16)) >> 8
-        if green != 0:
-            green = min(max(green, RGB_FLOOR), 255)
-        blue = (color & int("0xFF", 16))
-        if blue != 0:
-            blue = min(max(blue , RGB_FLOOR), 255)
-        newcolor = (red << 16) + (green << 8) + blue
-        await self.async_write_feature_by_name(featureset_id, "rgbColor", newcolor)
-
-    def get_switches(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_switch()]
-
-    def get_lights(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_light()]
-
-    def get_climates(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_climate()]
-
-    def get_covers(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_cover()]
-
-    def get_energy(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_energy()]
-
-    def get_windowsensors(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_windowsensor()]
-
-    def get_motionsensors(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_motionsensor()]
-
-    def get_hubs(self):
-        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_hub()]
 
     #########################################################
     # Connection
@@ -373,6 +420,7 @@ class LWLink2:
                 result = await self._connect_to_server()
                 if force_keep_alive_secs > 0:
                     asyncio.ensure_future(self.async_force_reconnect(force_keep_alive_secs))
+                
                 return result
             except Exception as exp:
                 if x < max_tries-1:
@@ -404,24 +452,25 @@ class LWLink2:
             authmess = _LWRFWebsocketMessage("user", "authenticate")
             authpayload = _LWRFWebsocketMessageItem({"token": self._authtoken, "clientDeviceId": self._device_id})
             authmess.additem(authpayload)
-            response = await self._async_sendmessage(authmess, redact = True)
-            if not response["items"][0]["success"]:
-                if response["items"][0]["error"]["code"] == "200":
+            responses = await self._async_sendmessage(authmess, redact = True)
+
+            if not responses[0]["success"]:
+                if responses[0]["error"]["code"] == "200":
                     # "Channel is already authenticated" - Do nothing
                     pass
-                elif response["items"][0]["error"]["code"] == 405:
+                elif responses[0]["error"]["code"] == 405:
                     # "Access denied" - bogus token, let's reauthenticate
                     # Lightwave seems to return a string for 200 but an int for 405!
                     _LOGGER.info("authenticate_websocket: Authentication token rejected, regenerating and reauthenticating")
                     self._authtoken = None
                     await self._authenticate_websocket()
-                elif response["items"][0]["error"]["message"] == "user-msgs: Token not valid/expired.":
+                elif responses[0]["error"]["message"] == "user-msgs: Token not valid/expired.":
                     _LOGGER.info("authenticate_websocket: Authentication token expired, regenerating and reauthenticating")
                     self._authtoken = None
                     await self._authenticate_websocket()
                 else:
-                    _LOGGER.warning("authenticate_websocket: Unhandled authentication error {}".format(response["items"][0]["error"]["message"]))
-            return response
+                    _LOGGER.warning("authenticate_websocket: Unhandled authentication error {}".format(responses[0]["error"]))
+            return responses
         else:
             return None
 
@@ -472,6 +521,246 @@ class LWLink2:
     def _sendmessage(self, message):
         return asyncio.get_event_loop().run_until_complete(self._async_sendmessage(message))
 
+    def connect(self):
+        return asyncio.get_event_loop().run_until_complete(self.async_connect())
+
+
+class LWLink2:
+
+    def __init__(self, username=None, password=None, auth_method="username", api_token=None, refresh_token=None, device_id=None):
+
+        self._ws = LWWebsocket(username, password, auth_method, api_token, refresh_token, device_id)
+
+        self.featuresets = {}
+        self.features = {}
+        self._group_ids = []
+
+        self._callbacks = []
+        self._feature_set_event_callbacks = {}
+
+        self._ws.register_event_handler("feature", self._feature_event_handler)
+        self._ws.register_event_handler("group", self.async_get_hierarchy)
+
+
+    async def _feature_event_handler(self, message):
+        _LOGGER.debug("_feature_event_handler: Event received - items: %s ", len(message["items"]))
+
+        if "featureId" in message["items"][0]["payload"]:
+            feature_id = message["items"][0]["payload"]["featureId"]
+            value = message["items"][0]["payload"]["value"]
+
+            # feature = self.get_feature_by_featureid(feature_id)
+            feature = None
+            if feature_id in self.features:
+                feature = self.features[feature_id]
+            
+            if feature is None:
+                _LOGGER.debug("_feature_event_handler: feature is None: %s)", feature_id)
+            else:
+                prev_value = feature.state
+                
+                feature.update_feature_state(value)
+
+                #  call any callbacks registered for this featues featureSet
+                for feature_set in feature.feature_sets:
+                    if feature_set.featureset_id in self._feature_set_event_callbacks:
+                        for func in self._feature_set_event_callbacks[feature_set.featureset_id]:
+                            func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+            
+            return feature
+
+
+    async def async_get_hierarchy(self):
+        _LOGGER.debug("async_get_hierarchy: Reading hierarchy")
+        readmess = _LWRFWebsocketMessage("user", "rootGroups")
+        readitem = _LWRFWebsocketMessageItem()
+        readmess.additem(readitem)
+        responses = await self._ws._async_sendmessage(readmess)
+
+        self._group_ids = []
+        for item in responses:
+            self._group_ids = self._group_ids + item["payload"]["groupIds"]
+
+        _LOGGER.debug("async_get_hierarchy: Reading groups {}".format(self._group_ids))
+        await self._async_read_groups()
+
+        await self.async_update_featureset_states()
+
+    async def _async_read_groups(self):
+        self.featuresets = {}
+        for groupId in self._group_ids:
+            readmess = _LWRFWebsocketMessage("group", "hierarchy")
+            readitem = _LWRFWebsocketMessageItem({"groupId": groupId})
+
+            readmess.additem(readitem)
+            hierarchy_responses = await self._ws._async_sendmessage(readmess)
+
+            readmess2 = _LWRFWebsocketMessage("group", "read")
+            readitem2 = _LWRFWebsocketMessageItem({"groupId": groupId,
+                                         "devices": True,
+                                         "devicesDetail": True,
+                                         "features": True,
+                                        #  "automations": True,
+                                         "subgroups": True,
+                                         "subgroupDepth": 10,
+                                        })
+            
+            readmess2.additem(readitem2)
+            group_read_responses = await self._ws._async_sendmessage(readmess2)
+
+            devices = list(group_read_responses[0]["payload"]["devices"].values())
+            features = list(group_read_responses[0]["payload"]["features"].values())
+
+            featuresets = list(hierarchy_responses[0]["payload"]["featureSet"])
+            
+            self.get_featuresets(featuresets, devices, features)
+
+    async def async_update_featureset_states(self):
+        # async with asyncio.TaskGroup() as tg:
+        #     for feature in self.features.values():
+        #         tg.create_task(feature.async_read_feature_state())
+        
+        id_map = {}
+        
+        def process_item_cb(response):
+            item_id = response["itemId"]
+            feature = id_map[item_id]
+            value = response["payload"]["value"]
+            feature.update_feature_state(value)
+
+        message = _LWRFWebsocketMessage("feature", "read", process_item_cb)
+
+        for feature in self.features.values():
+            # readitem = _LWRFWebsocketMessageItem({ "featureId": feature.id, "noCache": True })
+            readitem = _LWRFWebsocketMessageItem({ "featureId": feature.id })
+            item_id = message.additem(readitem)
+            id_map[item_id] = feature
+            
+        await self._ws._async_sendmessage(message, process_item_cb)
+
+    async def async_write_feature(self, feature_id, value):
+        readmess = _LWRFWebsocketMessage("feature", "write")
+        readitem = _LWRFWebsocketMessageItem({"featureId": feature_id, "value": value})
+        readmess.additem(readitem)
+        await self._ws._async_sendmessage(readmess)
+
+    async def async_write_feature_by_name(self, featureset_id, featurename, value):
+        await self.featuresets[featureset_id].features[featurename].set_state(value)
+
+    async def async_read_feature(self, feature_id):
+        readmess = _LWRFWebsocketMessage("feature", "read")
+        readitem = _LWRFWebsocketMessageItem({"featureId": feature_id})
+        readmess.additem(readitem)
+        return await self._ws._async_sendmessage(readmess)
+
+    def get_featureset_by_featureid(self, feature_id):
+        for x in self.featuresets.values():
+            for y in x.features.values():
+                if y.id == feature_id:
+                    return x
+        return None
+
+    def get_feature_by_featureid(self, feature_id):
+        for x in self.featuresets.values():
+            for y in x.features.values():
+                if y.id == feature_id:
+                    return y
+        return None
+
+    async def async_turn_on_by_featureset_id(self, featureset_id):
+        await self.async_write_feature_by_name(featureset_id, "switch", 1)
+
+    async def async_turn_off_by_featureset_id(self, featureset_id):
+        await self.async_write_feature_by_name(featureset_id, "switch", 0)
+
+    async def async_set_brightness_by_featureset_id(self, featureset_id, level):
+        await self.async_write_feature_by_name(featureset_id, "dimLevel", level)
+
+    async def async_set_temperature_by_featureset_id(self, featureset_id, level):
+        await self.async_write_feature_by_name(featureset_id, "targetTemperature", int(level * 10))
+
+    async def async_set_valvelevel_by_featureset_id(self, featureset_id, level):
+        await self.async_write_feature_by_name(featureset_id, "valveLevel", int(level * 20))
+
+    async def async_cover_open_by_featureset_id(self, featureset_id):
+        await self.async_write_feature_by_name(featureset_id, "threeWayRelay", 1)
+
+    async def async_cover_close_by_featureset_id(self, featureset_id):
+        await self.async_write_feature_by_name(featureset_id, "threeWayRelay", 2)
+
+    async def async_cover_stop_by_featureset_id(self, featureset_id):
+        await self.async_write_feature_by_name(featureset_id, "threeWayRelay", 0)
+
+    async def async_set_led_rgb_by_featureset_id(self, featureset_id, color, feature_type="rgbColor"):
+        red = (color & int("0xFF0000", 16)) >> 16
+        if red != 0:
+            red = min(max(red, RGB_FLOOR), 255)
+        green = (color & int("0xFF00", 16)) >> 8
+        if green != 0:
+            green = min(max(green, RGB_FLOOR), 255)
+        blue = (color & int("0xFF", 16))
+        if blue != 0:
+            blue = min(max(blue , RGB_FLOOR), 255)
+        newcolor = (red << 16) + (green << 8) + blue
+        await self.async_write_feature_by_name(featureset_id, feature_type, newcolor)
+
+    def get_switches(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_switch()]
+    
+    def get_sockets(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_outlet()]
+    
+    def get_lights(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_light()]
+
+    def get_climates(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_climate()]
+
+    def get_covers(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_cover()]
+
+    def get_energy(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_energy()]
+
+    def get_windowsensors(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_windowsensor()]
+
+    def get_motionsensors(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_motionsensor()]
+
+    def get_with_feature(self, feature):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.has_feature(feature)]
+
+    def get_hubs(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_hub()]
+
+    #########################################################
+    # WS Interface
+    #########################################################
+    async def async_register_callback________REMOVE________(self, callback):
+        _LOGGER.debug("async_register_callback: Register callback '%s'", callback.__name__)
+        self._callbacks.append(callback)
+
+    async def async_register_feature_callback(self, featureset_id, callback):
+        _LOGGER.debug("async_register_feature_callback: Register callback %s - '%s'", featureset_id, callback.__name__)
+        if (featureset_id not in self._feature_set_event_callbacks):
+            self._feature_set_event_callbacks[featureset_id] = []
+        self._feature_set_event_callbacks[featureset_id].append(callback)
+
+    async def async_connect(self, max_tries=5, force_keep_alive_secs=0):
+        return await self._ws.async_connect(max_tries, force_keep_alive_secs)
+
+    async def async_force_reconnect(self, secs):
+        self._ws.async_force_reconnect(secs)
+
+
+    #########################################################
+    # Convenience methods for non-async calls
+    #########################################################
+
+    def _sendmessage(self, message):
+        return asyncio.get_event_loop().run_until_complete(self._ws._async_sendmessage(message))
+
     def get_hierarchy(self):
         return asyncio.get_event_loop().run_until_complete(self.async_get_hierarchy())
 
@@ -509,7 +798,7 @@ class LWLink2:
         return asyncio.get_event_loop().run_until_complete(self.async_cover_stop_by_featureset_id(featureset_id))
 
     def connect(self):
-        return asyncio.get_event_loop().run_until_complete(self.async_connect())
+        return asyncio.get_event_loop().run_until_complete(self._ws.async_connect())
 
     def get_from_lw_ar_by_id(self, ar, id, label):
         for x in ar:
@@ -526,19 +815,42 @@ class LWLink2:
             device = self.get_from_lw_ar_by_id(devices, y["deviceId"], "deviceId")
 
             new_featureset.product_code = device["productCode"]
+            if "virtualProductCode" in device:
+                new_featureset.virtual_product_code = device["virtualProductCode"]
+            new_featureset.firmware_version = device["firmwareVersion"]
+            new_featureset.manufacturer_code = device["manufacturerCode"]
+            new_featureset.serial = device["serial"]
 
             new_featureset.name = y["name"]
 
-            for z in y["features"]:
-                feature = LWRFFeature()
-                feature.id = z
-                feature.featureset = new_featureset
+            for feature_id in y["features"]:
+                if feature_id in self.features:
+                    feature = self.features[feature_id]
+                    featureType = feature.name
+                else:
+                    _lw_Feature = self.get_from_lw_ar_by_id(features, feature_id, 'featureId')
+                    featureType = _lw_Feature["attributes"]["type"]
 
-                _feature = self.get_from_lw_ar_by_id(features, z, 'featureId')
-                feature.name = _feature["attributes"]["type"]
-                new_featureset.features[_feature["attributes"]["type"]] = feature
+                    if featureType == "uiIOMap":
+                        count = 0
+                        for featureId in device["featureIds"]:
+                            __feature = self.get_from_lw_ar_by_id(features, featureId, 'featureId')
+                            __featureType = __feature["attributes"]["type"]
+                            if __featureType == "uiIOMap":
+                                count += 1
+
+                        feature = LWRFUiIOMapFeature(feature_id, _lw_Feature, self, count)
+                    else:
+                        feature = LWRFFeature(feature_id, _lw_Feature, self)
+
+                    self.features[feature_id] = feature
+
+
+                feature.add_feature_set(new_featureset)
+                new_featureset.features[featureType] = feature
 
             self.featuresets[y["groupId"]] = new_featureset
+
 
 
 class LWLink2Public(LWLink2):

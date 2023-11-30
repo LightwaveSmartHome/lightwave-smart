@@ -179,14 +179,16 @@ class LWRFFeature:
     def update_feature_state(self, state):
         self._state = state
 
-    async def async_read_feature_state(self):
-        responses = await self.link.async_read_feature(self.id)
-
-        if responses[0]["success"] == True:
-            state = responses[0]["payload"]["value"]
+    def process_feature_read(self, response):
+        if response["success"] == True:
+            state = response["payload"]["value"]
             self.update_feature_state(state)
         else:
-            _LOGGER.warning("update_feature_state: failed to read feature ({}), returned {}".format(self.id, responses))
+            _LOGGER.warning("process_feature_read: failed to read feature ({}), returned {}".format(self.id, response))
+        
+    async def async_read_feature_state(self):
+        responses = await self.link.async_read_feature(self.id)
+        self.process_feature_read(responses[0])
 
 
 class UiIOMapEncoderDecoder:
@@ -653,13 +655,12 @@ class LWLink2:
         
         id_map = {}
         
-        def process_item_cb(response):
+        def process_read_item_cb(response):
             item_id = response["itemId"]
             feature = id_map[item_id]
-            value = response["payload"]["value"]
-            feature.update_feature_state(value)
+            feature.process_feature_read(response)
 
-        message = _LWRFWebsocketMessage("feature", "read", process_item_cb)
+        message = _LWRFWebsocketMessage("feature", "read", process_read_item_cb)
 
         for feature in self.features.values():
             # readitem = _LWRFWebsocketMessageItem({ "featureId": feature.id, "noCache": True })
@@ -667,7 +668,7 @@ class LWLink2:
             item_id = message.additem(readitem)
             id_map[item_id] = feature
             
-        await self._ws._async_sendmessage(message, process_item_cb)
+        await self._ws._async_sendmessage(message, process_read_item_cb)
 
     async def async_write_feature(self, feature_id, value):
         readmess = _LWRFWebsocketMessage("feature", "write")

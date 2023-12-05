@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="lightwave_smart",
-    version="0.8.26",
+    version="0.8.27",
     author="Bryan Blunt / Lightwave",
     author_email="dev@lightwaverf.com",
     description="Controls for Lightwave Smart Series (second generation) devices",

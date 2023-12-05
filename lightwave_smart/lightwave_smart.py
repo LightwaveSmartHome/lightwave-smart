@@ -857,8 +857,11 @@ class LWLink2:
             if "virtualProductCode" in device:
                 new_featureset.virtual_product_code = device["virtualProductCode"]
             new_featureset.firmware_version = device["firmwareVersion"]
-            new_featureset.manufacturer_code = device["manufacturerCode"]
-            new_featureset.serial = device["serial"]
+            
+            if "manufacturerCode" in device:
+                new_featureset.manufacturer_code = device["manufacturerCode"]
+            if "serial" in device:
+                new_featureset.serial = device["serial"]
 
             new_featureset.name = y["name"]
 

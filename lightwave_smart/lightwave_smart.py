@@ -104,6 +104,7 @@ class LWRFFeatureSet:
         self.link = None
 
         self.featureset_id = None
+        self.primary_feature_type = None
         self.name = None
         self.product_code = None
         self.virtual_product_code = None
@@ -864,6 +865,18 @@ class LWLink2:
                 new_featureset.serial = device["serial"]
 
             new_featureset.name = y["name"]
+            
+            primaryFeatureId = None
+            if "primaryFeatureId" in y:
+                primaryFeatureId = y["primaryFeatureId"]
+            else:
+                # We can try to guess the primary feature
+                for feature_id in y["features"]:
+                    _lw_Feature = self.get_from_lw_ar_by_id(features, feature_id, 'featureId')
+                    featureType = _lw_Feature["attributes"]["type"]
+                    if featureType == "switch":
+                        primaryFeatureId = feature_id
+                        break
 
             for feature_id in y["features"]:
                 if feature_id in self.features:
@@ -894,6 +907,10 @@ class LWLink2:
 
                 feature.add_feature_set(new_featureset)
                 new_featureset.features[featureType] = feature
+                
+                if primaryFeatureId == feature_id:
+                    new_featureset.primary_feature_type = featureType
+
 
             self.featuresets[y["groupId"]] = new_featureset
 

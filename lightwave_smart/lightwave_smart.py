@@ -600,6 +600,10 @@ class LWLink2:
                         if feature_set.featureset_id in self._feature_set_event_callbacks:
                             for func in self._feature_set_event_callbacks[feature_set.featureset_id]:
                                 func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+
+                    for gen_func in self._callbacks:
+                        gen_func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+
                 
                 return feature
 
@@ -777,8 +781,10 @@ class LWLink2:
     #########################################################
     # WS Interface
     #########################################################
-    async def async_register_callback________REMOVE________(self, callback):
-        _LOGGER.debug("async_register_callback: Register callback '%s'", callback.__name__)
+    
+    # Warning using async_register_general_callback will result in lots of callbacks
+    async def async_register_general_callback(self, callback):
+        _LOGGER.debug("async_register_general_callback: Register callback '%s'", callback.__name__)
         self._callbacks.append(callback)
 
     async def async_register_feature_callback(self, featureset_id, callback):

@@ -13,10 +13,12 @@ from .utils import get_highest_version
 _LOGGER = logging.getLogger(__name__)
 
 AUTH_SERVER = "https://auth.lightwaverf.com/v2/lightwaverf/autouserlogin/lwapps"
-TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
-VERSION = "1.6.8"
+TRANS_SERVER = "ws://localhost:8001"
+# TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
+VERSION = "1.6.9"
 MAX_RETRIES = 5
-PUBLIC_AUTH_SERVER = "https://auth.lightwaverf.com/token"
+# PUBLIC_AUTH_SERVER = "https://auth.lightwaverf.com/token"
+PUBLIC_AUTH_SERVER = "http://localhost:3000/token"
 PUBLIC_API = "https://publicapi.lightwaverf.com/v1/"
 RGB_FLOOR = int("0x0", 16) #Previously the Lightwave app floored RGB values, but it doesn't any more
 
@@ -121,7 +123,7 @@ class LWRFDevice:
         
     def is_gen2(self): 
         if self.manufacturer_code == 'LightwaveRF':
-            if self.product_code[0,1] == 'L' and self.product_code[0,2] != 'LW':
+            if self.product_code[0] == 'L' and self.product_code[:2] != 'LW':
                 return True
             
         return False
@@ -778,7 +780,7 @@ class LWLink2:
                         _LOGGER.warning("_async_read_firmware - firmware_version:  ('{}')".format(firmware_version))
                         # device.latest_firmware_release_url = None
                     
-                    self._firmware_event_handler(device_id)
+                    await self._firmware_event_handler(device_id)
                 
             
             
@@ -907,6 +909,9 @@ class LWLink2:
 
     def get_with_feature(self, feature):
         return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.has_feature(feature)]
+
+    def get_buttons(self):
+        return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_light()]
 
     def get_hubs(self):
         return [(x.featureset_id, x.name) for x in self.featuresets.values() if x.is_hub()]

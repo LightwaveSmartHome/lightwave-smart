@@ -94,7 +94,7 @@ class LWRFDevice:
         # for now use the release for the highest FM version found
         
         release_id = None
-        new_version = None
+        latest_version = None
         for release in releases:
             to_version = release["versionPaths"][-1]
             compare_versions = [to_version, self.latest_firmware_version]
@@ -102,7 +102,7 @@ class LWRFDevice:
             highest_version = get_highest_version(compare_versions)
             
             if highest_version == to_version:
-                new_version = to_version
+                latest_version = to_version
                 release_id = release["_id"]
                 
         firmware_description = None
@@ -115,8 +115,12 @@ class LWRFDevice:
             firmware_versions = notes_responses[0]["payload"]["firmwareVersions"]
             for firmware_version in firmware_versions:
                 firmware_description = firmware_version["description"]
+                
+        if latest_version is None:
+            # releases is a response from "readForDevice", which only returns releases if the current firmware version is not the latest
+            latest_version = self.firmware_version
             
-        self.update_latest_firmware_info(new_version, release_id, firmware_description)
+        self.update_latest_firmware_info(latest_version, release_id, firmware_description)
 
     
 

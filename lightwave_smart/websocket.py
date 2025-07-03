@@ -11,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 MAX_PENDING_ITEMS = 2000
 
 VERSION = "1.6.9"
-CLIENT_ID_PREFIX = "1"
+CLIENT_ID_PREFIX = "2"
 
 PUBLIC_AUTH_SERVER = "https://auth.lightwaverf.com/token"
 AUTH_SERVER = "https://auth.lightwaverf.com/v2/lightwaverf/autouserlogin/lwapps"
@@ -71,7 +71,7 @@ class LWWebsocket:
         self._eventHandlers = {}
 
         # Websocket only variables:
-        self._device_id = (device_id or ("PLW2:" + CLIENT_ID_PREFIX + ":")) + str(uuid.uuid4())
+        self._device_id = (device_id or ("PLW2-" + CLIENT_ID_PREFIX + ":")) + str(uuid.uuid4())
         self._websocket = None
 
         self._transaction_queue = asyncio.PriorityQueue()

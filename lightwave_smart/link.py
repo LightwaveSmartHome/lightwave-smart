@@ -7,13 +7,14 @@ from .message import LW_WebsocketMessage
 from .device import LWRFDevice, LWRFFeatureSet, LWRFFeature, LWRFUiIOMapFeature, LWRFUiButtonFeature
 
 _LOGGER = logging.getLogger(__name__)
-# _LOGGER.setLevel(logging.INFO)
 
 RGB_FLOOR = int("0x0", 16) #Previously the Lightwave app floored RGB values, but it doesn't any more
 
 class LWLink2:
     def __init__(self, username=None, password=None, auth_method="username", api_token=None, refresh_token=None, device_id=None):
         self._ws = LWWebsocket(username, password, auth_method, api_token, refresh_token, device_id)
+        
+        self.structures = {}    # structureId -> linkPlus featureset_id
         
         self.devices = {}
         self.featuresets = {}
@@ -403,6 +404,10 @@ class LWLink2:
                     device.serial = _device["serial"]
                 
                 self.devices[device.device_id] = device
+                
+                if device.is_hub():
+                    structure_id = self.get_structure_id(device.device_id)
+                    self.structures[structure_id] = new_featureset.featureset_id
                     
             new_featureset.device = device
             device.add_featureset(new_featureset)
@@ -457,3 +462,13 @@ class LWLink2:
 
 
             self.featuresets[y["groupId"]] = new_featureset
+
+    def get_structure_id(self, thing_id):
+        # thing_id = [structureId]-[group id] OR [structureId]-[deviceId]-[link id]+[reset id]
+        return thing_id.split("-")[0]
+    
+    def get_linkPlus_featureset_id(self, thing_id):
+        structure_id = self.get_structure_id(thing_id)
+        if structure_id in self.structures:
+            return self.structures[structure_id]
+        return None

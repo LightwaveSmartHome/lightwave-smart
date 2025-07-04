@@ -35,6 +35,8 @@ class LWRFDevice:
     @property
     def name(self):
         return " - ".join([featureset.name for featureset in self.featuresets])
+
+    def is_hub(self): return self.product_code == "L2"
         
     def is_gen2(self): 
         if self.manufacturer_code == 'LightwaveRF':
@@ -179,10 +181,10 @@ class LWRFFeatureSet:
     def is_energy(self): return (self.has_feature('energy')) and (self.has_feature('rssi'))
     def is_windowsensor(self): return self.has_feature('windowPosition')
     def is_motionsensor(self): return self.has_feature('movement')
-    def is_hub(self): return self.has_feature('buttonPress')
+    def is_hub(self): return self.device.is_hub()
     def is_remote(self): return (self.has_feature('uiButton') or self.has_feature('uiButtonPair')) and self.has_feature('batteryLevel')
 
-    def is_gen2(self): return (self.has_feature('upgrade') or self.has_feature('uiButton') or self.is_hub())
+    def is_gen2(self): return self.device.is_gen2()
     def reports_power(self): return self.has_feature('power')
     def has_led(self): return self.has_feature('rgbColor') and not self.virtual_product_code
     def has_uiIndicator(self): return self.has_feature('uiIndicator')

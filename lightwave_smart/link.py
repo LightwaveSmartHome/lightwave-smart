@@ -14,7 +14,7 @@ class LWLink2:
     def __init__(self, username=None, password=None, auth_method="username", api_token=None, refresh_token=None, device_id=None):
         self._ws = LWWebsocket(username, password, auth_method, api_token, refresh_token, device_id)
         
-        self.structures = {}    # structureId -> linkPlus featureset_id
+        self.structures = {}    # structureId -> {linkPlus_featureset_id, name}
         
         self.devices = {}
         self.featuresets = {}
@@ -115,9 +115,14 @@ class LWLink2:
         for groupId in self._group_ids:
             read_hierarchy = LW_WebsocketMessage("group", "hierarchy")
             read_hierarchy.add_item({"groupId": groupId})
-
+            
             hierarchy_responses = await self._ws.async_sendmessage(read_hierarchy)
-
+            
+            if "success" in hierarchy_responses[0] and hierarchy_responses[0]["success"] != True:
+                _LOGGER.warning(f"_async_read_groups: Error reading group hierarchy - groupId: {groupId} - {hierarchy_responses}")
+                
+            self.set_structure_data_from_hierarchy(groupId, hierarchy_responses[0])
+            
             read_group = LW_WebsocketMessage("group", "read")
             read_group.add_item({"groupId": groupId,
                                          "devices": True,
@@ -406,8 +411,7 @@ class LWLink2:
                 self.devices[device.device_id] = device
                 
                 if device.is_hub():
-                    structure_id = self.get_structure_id(device.device_id)
-                    self.structures[structure_id] = new_featureset.featureset_id
+                    self.set_structure_data(device.device_id, new_featureset.featureset_id)
                     
             new_featureset.device = device
             device.add_featureset(new_featureset)
@@ -470,5 +474,45 @@ class LWLink2:
     def get_linkPlus_featureset_id(self, thing_id):
         structure_id = self.get_structure_id(thing_id)
         if structure_id in self.structures:
-            return self.structures[structure_id]
+            return self.structures[structure_id]["linkPlus_featureset_id"]
         return None
+    
+    def get_structure_name(self, thing_id):
+        structure_id = self.get_structure_id(thing_id)
+        if structure_id in self.structures:
+            return self.structures[structure_id]["name"]
+        return None
+    
+    def set_structure_data(self, thing_id, linkPlus_featureset_id = None, name = None):
+        structure_id = self.get_structure_id(thing_id)
+        if structure_id in self.structures:
+            if linkPlus_featureset_id is not None:
+                self.structures[structure_id]["linkPlus_featureset_id"] = linkPlus_featureset_id
+            if name is not None:
+                self.structures[structure_id]["name"] = name
+        else:
+            self.structures[structure_id] = {
+                "linkPlus_featureset_id": linkPlus_featureset_id,
+                "name": name
+            }
+
+    def set_structure_data_from_hierarchy(self, groupId, hierarchy_response):
+        linkFeatureSetId, rootName = None, None
+        
+        try:
+            payload = hierarchy_response["payload"]
+            if (payload["link"] is not None and len(payload["link"]) > 0):
+                link = payload["link"][0]
+                
+                if "featureSets" in link:
+                    linkFeatureSets = link["featureSets"]
+                    if linkFeatureSets is not None and len(linkFeatureSets) > 0:
+                        linkFeatureSetId = linkFeatureSets[0]
+                
+                if "root" in payload:
+                    rootName = payload["root"][0]["name"]
+                
+        except Exception as e:
+            _LOGGER.error(f"set_structure_data_from_hierarchy: Error setting structure data - groupId: {groupId} - {hierarchy_response} - {str(e)} - {traceback.format_exc()}")
+            
+        self.set_structure_data(groupId, linkFeatureSetId, rootName)

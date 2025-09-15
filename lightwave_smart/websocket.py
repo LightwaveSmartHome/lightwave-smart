@@ -11,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 MAX_PENDING_ITEMS = 2000
 
 VERSION = "1.6.9"
-CLIENT_ID_PREFIX = "2"
+CLIENT_ID_PREFIX = "3"
 
 PUBLIC_AUTH_SERVER = "https://auth.lightwaverf.com/token"
 AUTH_SERVER = "https://auth.lightwaverf.com/v2/lightwaverf/autouserlogin/lwapps"

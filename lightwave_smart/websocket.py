@@ -4,7 +4,6 @@ import datetime
 import aiohttp
 import logging
 from .message import LW_WebsocketMessage, LW_WebsocketMessageBatch
-from socket import ConnectionRefusedError, OSError
 
 _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
@@ -74,6 +73,7 @@ class LWWebsocket:
         # Websocket only variables:
         self._device_id = (device_id or ("PLW2-" + CLIENT_ID_PREFIX + ":")) + str(uuid.uuid4())
         self._websocket = None
+        self._connect_callbacks = []
 
         self._transaction_queue = asyncio.PriorityQueue()
         self._pending_items_manager = PendingItemsManager()
@@ -302,6 +302,8 @@ class LWWebsocket:
                 self._eventHandlers[eventClass][None] = []
             self._eventHandlers[eventClass][None].append(callback)
 
+    def register_connect_callback(self, callback):
+        self._connect_callbacks.append(callback)
 
     #########################################################
     # Connection
@@ -318,13 +320,23 @@ class LWWebsocket:
             tran_message.complete()                 # will be called potentially multiple times for the same message
         self._pending_items_manager.clear()
 
-    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source=None):
+    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source=None, connect_callback=None):
         start_time = datetime.datetime.now()
+        
+        if connect_callback:
+            self.register_connect_callback(connect_callback)
+        
+        authenticated = False
         
         connected = await self._connect_to_server(max_tries, source)
         if not connected:
             _LOGGER.error(f"async_connect: Cannot connect ({source}) - aborting after: {datetime.datetime.now() - start_time}")
             return False
+        
+        
+        attempt_delay = 60
+        if max_tries is not None:
+            attempt_delay = 5
 
         max_auth_retries = max_tries if max_tries is not None else 10
         attempt = 0
@@ -337,20 +349,28 @@ class LWWebsocket:
                     if force_keep_alive_secs > 0:
                         asyncio.ensure_future(self.async_force_reconnect(force_keep_alive_secs))
                         
-                    return True
+                    authenticated = True
+                    break
                     
                 else:
-                    _LOGGER.warning(f"async_connect: Not authenticated ({source}) - retrying in {attempt * 60} seconds")
-                    await asyncio.sleep(attempt * 60)
+                    _LOGGER.warning(f"async_connect: Not authenticated ({source}) - retrying at {datetime.datetime.now() + datetime.timedelta(seconds=attempt * attempt_delay)}")
+                    await asyncio.sleep(attempt * attempt_delay)
                     continue
                 
             except Exception as exp:
-                _LOGGER.warning(f"async_connect: Exception ({source}) - Attempt {attempt} - retrying in {attempt * 60} seconds - exception: '{repr(exp)}'")
-                await asyncio.sleep(attempt * 60)
+                _LOGGER.warning(f"async_connect: Exception ({source}) - Attempt {attempt} - retrying at {datetime.datetime.now() + datetime.timedelta(seconds=attempt * attempt_delay)} - exception: '{repr(exp)}'")
+                await asyncio.sleep(attempt * attempt_delay)
                 continue
 
-        _LOGGER.error(f"async_connect: Cannot authenticate ({source}) - aborting after: {datetime.datetime.now() - start_time} and {attempt} attempts")
-        return False
+        if authenticated:
+            _LOGGER.info(f"async_connect: Authenticated ({source}) - after: {datetime.datetime.now() - start_time} and {attempt} attempts")
+            if self._connect_callbacks:
+                for callback in self._connect_callbacks:
+                    await callback()
+        else:
+            _LOGGER.error(f"async_connect: Cannot authenticate ({source}) - aborting after: {datetime.datetime.now() - start_time} and {attempt} attempts")
+
+        return authenticated
 
     async def async_force_reconnect(self, secs):
         while True:
@@ -364,6 +384,9 @@ class LWWebsocket:
         await self.clean_up()
         
         network_retry_delay = 60
+        if max_tries is not None:
+            network_retry_delay = 5
+            
         attempt = 0
         while max_tries is None or attempt < max_tries:
             try:
@@ -385,7 +408,7 @@ class LWWebsocket:
                 delay = network_retry_delay
                 if attempt > 5:
                     delay = delay * attempt
-                _LOGGER.warning(f"connect_to_server: Network error ({source}) - Attempt {attempt} - Waiting {delay} seconds to retry - exception: '{repr(exp)}'")
+                _LOGGER.warning(f"connect_to_server: Network error ({source}) - Attempt {attempt} - Retrying at {datetime.datetime.now() + datetime.timedelta(seconds=delay)} - exception: '{repr(exp)}'")
                 await asyncio.sleep(delay)
                 continue
                 
@@ -393,7 +416,7 @@ class LWWebsocket:
                 delay = network_retry_delay
                 if attempt > 5:
                     delay = delay * attempt
-                _LOGGER.warning(f"connect_to_server: Exception ({source}) - Attempt {attempt} - Waiting {delay} seconds to retry - exception: '{repr(exp)}'")
+                _LOGGER.warning(f"connect_to_server: Exception ({source}) - Attempt {attempt} - Retrying at {datetime.datetime.now() + datetime.timedelta(seconds=delay)} - exception: '{repr(exp)}'")
                 await asyncio.sleep(delay)
                 continue
             

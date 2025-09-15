@@ -320,8 +320,8 @@ class LWLink2:
         else:
             _LOGGER.warning(f"async_register_firmware_event_callback: Device not found: {device_id}")
 
-    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source="link-async_connect"):
-        return await self._ws.async_connect(max_tries, force_keep_alive_secs, source)
+    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source="link-async_connect", connect_callback=None):
+        return await self._ws.async_connect(max_tries, force_keep_alive_secs, source, connect_callback)
 
     async def async_force_reconnect(self, secs):
         self._ws.async_force_reconnect(secs)

@@ -4,6 +4,7 @@ import datetime
 import aiohttp
 import logging
 from .message import LW_WebsocketMessage, LW_WebsocketMessageBatch
+from socket import ConnectionRefusedError, OSError
 
 _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
@@ -317,29 +318,38 @@ class LWWebsocket:
             tran_message.complete()                 # will be called potentially multiple times for the same message
         self._pending_items_manager.clear()
 
-    async def async_connect(self, max_tries=10, force_keep_alive_secs=0, source=None):
-        retry_delay = 2
+    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source=None):
         start_time = datetime.datetime.now()
-        for x in range(0, max_tries):
-            try:
-                result = await self._connect_to_server()
-                if force_keep_alive_secs > 0:
-                    asyncio.ensure_future(self.async_force_reconnect(force_keep_alive_secs))
-                
-                return result
-            except Exception as exp:
-                if isinstance(exp, asyncio.InvalidStateError):
-                    _LOGGER.warning("async_connect: InvalidStateError - recreating session")
-                    self._session = aiohttp.ClientSession()
-                
-                if x < max_tries-1:
-                    _LOGGER.warning(f"async_connect: Cannot connect - Attempt {x+1} of {max_tries} - Waiting {retry_delay} seconds to retry - exception: '{repr(exp)}'")
-                    await asyncio.sleep(retry_delay)
-                    retry_delay = min(2 * retry_delay, 60*2)
-                else:
-                    _LOGGER.warning(f"async_connect: Cannot connect - No more retry - exception: '{repr(exp)}'")
+        
+        connected = await self._connect_to_server(max_tries, source)
+        if not connected:
+            _LOGGER.error(f"async_connect: Cannot connect ({source}) - aborting after: {datetime.datetime.now() - start_time}")
+            return False
 
-        _LOGGER.warning(f"async_connect: Cannot connect - max_tries exceeded, aborting after: {datetime.datetime.now() - start_time} seconds")
+        max_auth_retries = max_tries if max_tries is not None else 10
+        attempt = 0
+        while attempt < max_auth_retries:
+            try:
+                attempt += 1
+                
+                authenticated = await self._authenticate_websocket('async_connect')                
+                if authenticated:
+                    if force_keep_alive_secs > 0:
+                        asyncio.ensure_future(self.async_force_reconnect(force_keep_alive_secs))
+                        
+                    return True
+                    
+                else:
+                    _LOGGER.warning(f"async_connect: Not authenticated ({source}) - retrying in {attempt * 60} seconds")
+                    await asyncio.sleep(attempt * 60)
+                    continue
+                
+            except Exception as exp:
+                _LOGGER.warning(f"async_connect: Exception ({source}) - Attempt {attempt} - retrying in {attempt * 60} seconds - exception: '{repr(exp)}'")
+                await asyncio.sleep(attempt * 60)
+                continue
+
+        _LOGGER.error(f"async_connect: Cannot authenticate ({source}) - aborting after: {datetime.datetime.now() - start_time} and {attempt} attempts")
         return False
 
     async def async_force_reconnect(self, secs):
@@ -349,41 +359,83 @@ class LWWebsocket:
             await self._websocket.close()
 
 
-    async def _connect_to_server(self):
-        _LOGGER.info("connect_to_server: Starting")
+    async def _connect_to_server(self, max_tries=None, source=None):
+        _LOGGER.info(f"connect_to_server: Starting ({source})")
         await self.clean_up()
         
-        if (not self._websocket) or self._websocket.closed:
-            _LOGGER.info("connect_to_server: Connecting to websocket")
-            self._websocket = await self._session.ws_connect(TRANS_SERVER, heartbeat=10)
-            _LOGGER.info("connect_to_server: Connected to websocket")
-            
-        return await self._authenticate_websocket('connect_to_server')
+        network_retry_delay = 60
+        attempt = 0
+        while max_tries is None or attempt < max_tries:
+            try:
+                attempt += 1
+                    
+                _LOGGER.info(f"connect_to_server: Connecting to websocket ({source}) - Attempt {attempt}")
+                self._websocket = await self._session.ws_connect(TRANS_SERVER, heartbeat=10)
+                _LOGGER.info(f"connect_to_server: Connected to websocket ({source}) - Attempt {attempt}")
+                break
 
-    async def _authenticate_websocket(self, source = None):
+            except asyncio.InvalidStateError as exp:
+                # Session state error - recreate session and continue
+                _LOGGER.warning(f"connect_to_server: InvalidStateError ({source}) - recreating session - Attempt {attempt}")
+                self._session = aiohttp.ClientSession()
+                continue
+            
+            except (aiohttp.ClientError, aiohttp.ClientConnectorError, aiohttp.ClientConnectionError, ConnectionRefusedError, OSError) as exp:
+                # Network-related errors
+                delay = network_retry_delay
+                if attempt > 5:
+                    delay = delay * attempt
+                _LOGGER.warning(f"connect_to_server: Network error ({source}) - Attempt {attempt} - Waiting {delay} seconds to retry - exception: '{repr(exp)}'")
+                await asyncio.sleep(delay)
+                continue
+                
+            except Exception as exp:
+                delay = network_retry_delay
+                if attempt > 5:
+                    delay = delay * attempt
+                _LOGGER.warning(f"connect_to_server: Exception ({source}) - Attempt {attempt} - Waiting {delay} seconds to retry - exception: '{repr(exp)}'")
+                await asyncio.sleep(delay)
+                continue
+            
+        return self._websocket is not None and not self._websocket.closed
+
+    async def _authenticate_websocket(self, source = None, retrying = False):
         if not self._authtoken:
             await self._get_access_token()
+            
         if self._authtoken:
             authmess = LW_WebsocketMessage("user", "authenticate")
             authmess.add_item({"token": self._authtoken, "clientDeviceId": self._device_id})
+            
             responses = await self.async_sendmessage(authmess, redact = True, immediate = True)
             if responses and responses[0] and not responses[0]["success"]:
                 if responses[0]["error"]["code"] == "200":
                     # "Channel is already authenticated" - Do nothing
                     pass
+                
                 elif responses[0]["error"]["code"] == 405:
                     # "Access denied" - bogus token, let's reauthenticate
                     # Lightwave seems to return a string for 200 but an int for 405!
+                    self._authtoken = None
+                    if retrying:
+                        return False
+                    
                     _LOGGER.info("authenticate_websocket: Authentication token rejected, regenerating and reauthenticating")
-                    self._authtoken = None
-                    await self._authenticate_websocket('405')
+                    return await self._authenticate_websocket('405', True)
+                    
                 elif responses[0]["error"]["message"] == "user-msgs: Token not valid/expired.":
-                    _LOGGER.info("authenticate_websocket: Authentication token expired, regenerating and reauthenticating")
                     self._authtoken = None
-                    await self._authenticate_websocket('expired')
+                    if retrying:
+                        return False
+                    
+                    _LOGGER.info("authenticate_websocket: Authentication token expired, regenerating and reauthenticating")
+                    return await self._authenticate_websocket('expired', True)
+                    
                 else:
                     _LOGGER.warning("authenticate_websocket: Unhandled authentication error {}".format(responses[0]["error"]))
-            return responses
+                    return False
+                    
+            return True
         else:
             return None
 

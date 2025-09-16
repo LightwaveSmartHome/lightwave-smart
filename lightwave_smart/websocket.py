@@ -56,6 +56,8 @@ class PendingItemsManager:
 
 class LWWebsocket:
     def __init__(self, username=None, password=None, auth_method="username", api_token=None, refresh_token=None, device_id=None):
+        self._active = None
+        
         self._authtoken = None
 
         self._username = username
@@ -73,6 +75,7 @@ class LWWebsocket:
         # Websocket only variables:
         self._device_id = (device_id or ("PLW2-" + CLIENT_ID_PREFIX + ":")) + str(uuid.uuid4())
         self._websocket = None
+        self._connectingTS = None
         self._connect_callbacks = []
 
         self._transaction_queue = asyncio.PriorityQueue()
@@ -80,14 +83,6 @@ class LWWebsocket:
 
         # Start background tasks
         self.background_tasks = set()
-        
-        task = asyncio.create_task(self._consumer_handler())
-        self.background_tasks.add(task)
-        # task.add_done_callback(self.background_tasks.discard)
-        
-        task = asyncio.create_task(self._process_transaction_queue())
-        self.background_tasks.add(task)
-        # task.add_done_callback(self.background_tasks.discard)
         
         self.next_message_event = asyncio.Event()
 
@@ -151,10 +146,11 @@ class LWWebsocket:
 
     
     async def _process_transaction_queue(self):
-        _LOGGER.debug("_process_transaction_queue: Starting")
-        while True:
+        logPre = f"_process_transaction_queue ({id(self)})"
+        _LOGGER.debug(f"{logPre}: Starting")
+        while self._active:
             if self._pending_items_manager.count >= MAX_PENDING_ITEMS:
-                _LOGGER.info(f"_process_transaction_queue - MAX:  SLEEPING max items reached - pending items: {self._pending_items_manager.count}")
+                _LOGGER.info(f"{logPre} - MAX:  SLEEPING max items reached - pending items: {self._pending_items_manager.count}")
                 
                 try:
                     waiter = self._pending_items_manager.start_event()
@@ -163,16 +159,16 @@ class LWWebsocket:
                         timeout=10
                     )
                     
-                    _LOGGER.debug(f"_process_transaction_queue - MAX:  CONTINUE - pending items: {self._pending_items_manager.count}")
+                    _LOGGER.debug(f"{logPre} - MAX:  CONTINUE - pending items: {self._pending_items_manager.count}")
                     
                 except asyncio.TimeoutError:
-                    _LOGGER.debug(f"_process_transaction_queue - MAX:  TIMEOUT - pending items: {self._pending_items_manager.count}")
+                    _LOGGER.debug(f"{logPre} - MAX:  TIMEOUT - pending items: {self._pending_items_manager.count}")
                     
                 except asyncio.CancelledError:
-                    _LOGGER.warning("_process_transaction_queue - MAX:  Wait cancelled")
+                    _LOGGER.warning(f"{logPre} - MAX:  Wait cancelled")
                 
                 except Exception as exp:
-                    _LOGGER.error(f"_process_transaction_queue - MAX:  ERROR - {str(exp)}")
+                    _LOGGER.error(f"{logPre} - MAX:  ERROR - {str(exp)}")
                 
                 continue
             
@@ -186,11 +182,11 @@ class LWWebsocket:
                 
             except asyncio.TimeoutError:
                 if self._pending_items_manager.count > 0:
-                    _LOGGER.info(f"_process_transaction_queue:  No new messages last 5 seconds - pending items: {self._pending_items_manager.count}")
+                    _LOGGER.info(f"{logPre}:  No new messages last 5 seconds - pending items: {self._pending_items_manager.count}")
                 continue
             
             except asyncio.CancelledError:
-                _LOGGER.warning("_process_transaction_queue:  Task cancelled")
+                _LOGGER.warning(f"{logPre}:  Task cancelled")
                 if message:
                     # If a message was retrieved before cancellation, put it back in the queue
                     await self._transaction_queue.put(message)
@@ -198,7 +194,7 @@ class LWWebsocket:
                 continue
             
             except Exception as exp:
-                _LOGGER.error(f"_process_transaction_queue:  Unhandled exception: {str(exp)}")
+                _LOGGER.error(f"{logPre}:  Unhandled exception: {str(exp)}")
                 await asyncio.sleep(1)  # Avoid rapid retries in case of persistent errors
                 continue
             
@@ -206,34 +202,35 @@ class LWWebsocket:
                 if message:
                     self._transaction_queue.task_done()
 
-            _LOGGER.debug(f"_process_transaction_queue (priority: {message.priority}) - tranId: {message._message['transactionId']} - cl/op: {message.opclass}/{message.operation} - pending items: {self._pending_items_manager.count}, queue size: {self._transaction_queue.qsize()}")
+            _LOGGER.debug(f"{logPre} (priority: {message.priority}) - tranId: {message._message['transactionId']} - cl/op: {message.opclass}/{message.operation} - pending items: {self._pending_items_manager.count}, queue size: {self._transaction_queue.qsize()}")
             await self._send_message_to_websocket(message)
 
             await asyncio.sleep(0.01)
                 
 
     async def _consumer_handler(self):
-        _LOGGER.debug("consumer_handler: Starting consumer handler")
-        while True:
+        logPre = f"consumer_handler ({id(self)})"
+        _LOGGER.debug(f"{logPre}: Starting consumer handler")
+        while self._active:
             try:
                 mess = await self._websocket.receive()
-                _LOGGER.debug(f"consumer_handler: Received: {mess}")
+                _LOGGER.debug(f"{logPre}: Received: {mess}")
             except AttributeError:  
                 # websocket is None if not set up, just wait for a while
-                _LOGGER.debug("consumer_handler: Websocket not ready, sleeping for 3 seconds")
+                _LOGGER.debug(f"{logPre}: Websocket not ready, sleeping for 3 seconds")
                 await asyncio.sleep(3)
                 continue
             except Exception as exp:
-                _LOGGER.warning(f"consumer_handler: Unhandled exception: {str(exp)}")
+                _LOGGER.warning(f"{logPre}: Unhandled exception: {str(exp)}")
                 continue
                 
-            _LOGGER.debug(f"consumer_handler: Received: {str(mess)}")
+            _LOGGER.debug(f"{logPre}: Received: {str(mess)}")
             
             if mess.type == aiohttp.WSMsgType.TEXT:
                 try:
                     # now parse the message
                     message = mess.json()
-                    _LOGGER.debug(f"consumer_handler: Received message - TranId: {message['transactionId']} - direction: {message['direction']} - cl/op: {message['class']}/{message['operation']}")
+                    _LOGGER.debug(f"{logPre}: Received message - TranId: {message['transactionId']} - direction: {message['direction']} - cl/op: {message['class']}/{message['operation']}")
                     
                     if message["direction"] == "response":
                         items_handled = 0
@@ -243,17 +240,17 @@ class LWWebsocket:
                                     tran_message = self._pending_items_manager.pop_item(item["itemId"])
                                     if tran_message:
                                         items_remaining = tran_message.add_item_response(item)
-                                        _LOGGER.debug(f"consumer_handler: Response - TranId: {message['transactionId']} - cl/op: {tran_message.opclass}/{tran_message.operation} - tran items_remaining: {items_remaining}")
+                                        _LOGGER.debug(f"{logPre}: Response - TranId: {message['transactionId']} - cl/op: {tran_message.opclass}/{tran_message.operation} - tran items_remaining: {items_remaining}")
                                         
                                         items_handled += 1
 
                         if items_handled > 0:
-                            _LOGGER.debug(f"consumer_handler: {items_handled} items handled for TranId: {message['transactionId']}")
+                            _LOGGER.debug(f"{logPre}: {items_handled} items handled for TranId: {message['transactionId']}")
 
                     elif message["direction"] == "notification":
                         if message["operation"] == "event":
                             if message["class"] in self._eventHandlers:
-                                _LOGGER.debug(f"consumer_handler: handling notification event of cl/op: {message['class']}/{message['operation']}")
+                                _LOGGER.debug(f"{logPre}: handling notification event of cl/op: {message['class']}/{message['operation']}")
                                 
                                 event_handlers = self._eventHandlers[message["class"]]
                                 
@@ -269,26 +266,26 @@ class LWWebsocket:
                                         for func in fns:
                                             tg.create_task(func(message))
                             else:
-                                _LOGGER.info(f"consumer_handler: Unhandled event message - cl/op: {message['class']}/{message['operation']}")
+                                _LOGGER.info(f"{logPre}: Unhandled event message - cl/op: {message['class']}/{message['operation']}")
                         else:
-                            _LOGGER.info(f"consumer_handler: Unhandled notification - cl/op: {message['class']}/{message['operation']}")
+                            _LOGGER.info(f"{logPre}: Unhandled notification - cl/op: {message['class']}/{message['operation']}")
                             
                     else:
-                        _LOGGER.info(f"consumer_handler: Unhandled message - cl/op: {message['class']}/{message['operation']}")
+                        _LOGGER.info(f"{logPre}: Unhandled message - cl/op: {message['class']}/{message['operation']}")
                         
                 except Exception as exp:
-                    _LOGGER.warning(f"consumer_handler: Error parsing message: {str(mess)} - Exception: {str(exp)}")
+                    _LOGGER.warning(f"{logPre}: Error parsing message: {str(mess)} - Exception: {str(exp)}")
                     
             elif mess.type == aiohttp.WSMsgType.CLOSED:
                 # We're not going to get a response, so clear response flag to allow _send_message to unblock
-                _LOGGER.warning("consumer_handler: Websocket closed")
+                _LOGGER.warning(f"{logPre}: Websocket closed")
                 self._websocket = None
                 await self.clean_up()
                 
                 #self._authtoken = None
-                asyncio.ensure_future(self.async_connect())
+                asyncio.ensure_future(self.async_connect(source="consumer_handler"))
                 # self.connect()
-                _LOGGER.info("consumer_handler: Websocket reconnect requested")
+                _LOGGER.info(f"{logPre}: Websocket reconnect requested")
 
     def register_event_handler(self, eventClass, callback, eventOperation=None):
         if eventClass not in self._eventHandlers:
@@ -308,6 +305,41 @@ class LWWebsocket:
     #########################################################
     # Connection
     #########################################################
+    async def async_deactivate(self):
+        _LOGGER.info(f"async_deactivate ({id(self)}): Deactivating - {len(self.background_tasks)} background tasks will be cancelled")
+        
+        self._active = None
+        await self.clean_up()
+        self._connect_callbacks = []
+        
+        if self._websocket:
+            await self._websocket.close()
+            self._websocket = None
+        
+        if self._session:
+            await self._session.close()
+        self._session = None
+        
+        while self.background_tasks:
+            task = self.background_tasks.pop()
+            task.cancel()
+        
+    def activate(self):
+        if self._active:
+            _LOGGER.warning(f"activate ({id(self)}): Already active")
+            return
+        
+        _LOGGER.info(f"activate ({id(self)}): Activating")
+        self._active = True
+        
+        task = asyncio.create_task(self._consumer_handler())
+        self.background_tasks.add(task)
+        # task.add_done_callback(self.background_tasks.discard)
+        
+        task = asyncio.create_task(self._process_transaction_queue())
+        self.background_tasks.add(task)
+        # task.add_done_callback(self.background_tasks.discard)
+    
     async def clean_up(self):
         while not self._transaction_queue.empty():
             try:
@@ -321,61 +353,88 @@ class LWWebsocket:
         self._pending_items_manager.clear()
 
     async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source=None, connect_callback=None):
-        start_time = datetime.datetime.now()
-        
-        if connect_callback:
-            self.register_connect_callback(connect_callback)
-        
-        authenticated = False
-        
-        connected = await self._connect_to_server(max_tries, source)
-        if not connected:
-            _LOGGER.error(f"async_connect: Cannot connect ({source}) - aborting after: {datetime.datetime.now() - start_time}")
+        if not self._active:
+            _LOGGER.error(f"async_connect ({id(self)}/{source}): Not active")
             return False
         
+        if self._connectingTS:
+            _LOGGER.warning(f"async_connect ({id(self)}/{source}): Connecting already in progress as of {self._connectingTS} - skipping")
+            return False
         
-        attempt_delay = 60
+        _LOGGER.info(f"async_connect ({id(self)}/{source}): - Connecting...")
+        self._connectingTS = datetime.datetime.now()
+        
+        connected = False
+        authenticated = False
+        try:
+            if connect_callback:
+                self.register_connect_callback(connect_callback)
+            
+            connected = await self._connect_to_server(max_tries, source)
+            if not connected:
+                _LOGGER.error(f"async_connect ({source}): Cannot connect - aborting after: {datetime.datetime.now() - self._connectingTS}")
+            else:
+                authenticated = await self._authenticate(max_tries, force_keep_alive_secs, source)
+
+                if authenticated:
+                    _LOGGER.info(f"async_connect ({source}): Connected and Authenticated - after: {datetime.datetime.now() - self._connectingTS}")
+                    if self._connect_callbacks:
+                        for callback in self._connect_callbacks:
+                            await callback()
+                else:
+                    _LOGGER.error(f"async_connect ({source}): Cannot authenticate - aborting after: {datetime.datetime.now() - self._connectingTS}")
+                
+        except Exception as exp:
+            _LOGGER.error(f"async_connect ({source}): Connected: {connected} - Authenticated: {authenticated} - Exception: {str(exp)}")
+            
+        if not connected or not authenticated:
+            if self._websocket:
+                await self._websocket.close()
+                self._websocket = None
+        
+        self._connectingTS = None
+        return connected and authenticated
+        
+    async def _authenticate(self, max_tries=None, force_keep_alive_secs=0, source=None):
+        max_auth_retries = 3
+        attempt_delay = 20
         if max_tries is not None:
+            max_auth_retries = max_tries
             attempt_delay = 5
 
-        max_auth_retries = max_tries if max_tries is not None else 10
+        authenticated = False
         attempt = 0
-        while attempt < max_auth_retries:
+        while self._active and attempt < max_auth_retries:
+            attempt += 1
+            retryMsg = ''
+            details = ''
+            
             try:
-                attempt += 1
-                
                 authenticated = await self._authenticate_websocket('async_connect')                
                 if authenticated:
                     if force_keep_alive_secs > 0:
                         asyncio.ensure_future(self.async_force_reconnect(force_keep_alive_secs))
-                        
-                    authenticated = True
                     break
                     
                 else:
-                    _LOGGER.warning(f"async_connect: Not authenticated ({source}) - retrying at {datetime.datetime.now() + datetime.timedelta(seconds=attempt * attempt_delay)}")
-                    await asyncio.sleep(attempt * attempt_delay)
-                    continue
+                    retryMsg = 'Not authenticated'
                 
             except Exception as exp:
-                _LOGGER.warning(f"async_connect: Exception ({source}) - Attempt {attempt} - retrying at {datetime.datetime.now() + datetime.timedelta(seconds=attempt * attempt_delay)} - exception: '{repr(exp)}'")
-                await asyncio.sleep(attempt * attempt_delay)
-                continue
-
-        if authenticated:
-            _LOGGER.info(f"async_connect: Authenticated ({source}) - after: {datetime.datetime.now() - start_time} and {attempt} attempts")
-            if self._connect_callbacks:
-                for callback in self._connect_callbacks:
-                    await callback()
-        else:
-            _LOGGER.error(f"async_connect: Cannot authenticate ({source}) - aborting after: {datetime.datetime.now() - start_time} and {attempt} attempts")
+                retryMsg = 'Exception'
+                details = f" - exception: '{repr(exp)}'"
+            
+            if attempt >= max_auth_retries:
+                break
+            
+            _LOGGER.warning(f"_authenticate ({source}): {retryMsg} - Attempt {attempt} - retrying at {datetime.datetime.now() + datetime.timedelta(seconds=attempt * attempt_delay)}{details}")
+            await asyncio.sleep(attempt * attempt_delay)
 
         return authenticated
 
     async def async_force_reconnect(self, secs):
-        while True:
+        while self._active:
             await asyncio.sleep(secs)
-            _LOGGER.error("async_force_reconnect: time elapsed, forcing a reconnection")
+            _LOGGER.warning(f"async_force_reconnect ({id(self)}): time elapsed, forcing a reconnection")
             await self._websocket.close()
 
 
@@ -383,15 +442,21 @@ class LWWebsocket:
         _LOGGER.info(f"connect_to_server: Starting ({source})")
         await self.clean_up()
         
-        network_retry_delay = 60
+        network_retry_delay = 30        # retry every 30 seconds, changing to 300 after 20 attempts (10 mins)
         if max_tries is not None:
             network_retry_delay = 5
             
         attempt = 0
-        while max_tries is None or attempt < max_tries:
+        while self._active and (max_tries is None or attempt < max_tries):
+            attempt += 1
+            
+            retryMsg = ''
+            details = ''
+            retryDelay = network_retry_delay
+            if attempt > 20 and max_tries is None:
+                retryDelay = 300
+            
             try:
-                attempt += 1
-                    
                 _LOGGER.info(f"connect_to_server: Connecting to websocket ({source}) - Attempt {attempt}")
                 self._websocket = await self._session.ws_connect(TRANS_SERVER, heartbeat=10)
                 _LOGGER.info(f"connect_to_server: Connected to websocket ({source}) - Attempt {attempt}")
@@ -399,30 +464,29 @@ class LWWebsocket:
 
             except asyncio.InvalidStateError as exp:
                 # Session state error - recreate session and continue
-                _LOGGER.warning(f"connect_to_server: InvalidStateError ({source}) - recreating session - Attempt {attempt}")
+                retryMsg = f"InvalidStateError"
+                details = f" - recreating session"
                 self._session = aiohttp.ClientSession()
-                continue
             
             except (aiohttp.ClientError, aiohttp.ClientConnectorError, aiohttp.ClientConnectionError, ConnectionRefusedError, OSError) as exp:
                 # Network-related errors
-                delay = network_retry_delay
-                if attempt > 5:
-                    delay = delay * attempt
-                _LOGGER.warning(f"connect_to_server: Network error ({source}) - Attempt {attempt} - Retrying at {datetime.datetime.now() + datetime.timedelta(seconds=delay)} - exception: '{repr(exp)}'")
-                await asyncio.sleep(delay)
-                continue
+                retryMsg = f"Network error"
+                details = f" - exception: '{repr(exp)}'"
                 
             except Exception as exp:
-                delay = network_retry_delay
-                if attempt > 5:
-                    delay = delay * attempt
-                _LOGGER.warning(f"connect_to_server: Exception ({source}) - Attempt {attempt} - Retrying at {datetime.datetime.now() + datetime.timedelta(seconds=delay)} - exception: '{repr(exp)}'")
-                await asyncio.sleep(delay)
-                continue
+                retryMsg = f"Unknown exception"
+                details = f" - exception: '{repr(exp)}'"
+                
+            max_tries_msg = f" of {max_tries}" if max_tries is not None else ""
+            _LOGGER.warning(f"connect_to_server ({source}): {retryMsg} - Attempt: {attempt}{max_tries_msg} - Retrying at: {datetime.datetime.now() + datetime.timedelta(seconds=retryDelay)}{details}")
+            
+            await asyncio.sleep(retryDelay)
             
         return self._websocket is not None and not self._websocket.closed
 
     async def _authenticate_websocket(self, source = None, retrying = False):
+        # return True if authenticated, False if failed, None if no authtoken
+        
         if not self._authtoken:
             await self._get_access_token()
             
@@ -438,7 +502,7 @@ class LWWebsocket:
                 
                 elif responses[0]["error"]["code"] == 405:
                     # "Access denied" - bogus token, let's reauthenticate
-                    # Lightwave seems to return a string for 200 but an int for 405!
+                    # Lightwave seems to return a string for 200 but an int for 405!  TODO - fix
                     self._authtoken = None
                     if retrying:
                         return False

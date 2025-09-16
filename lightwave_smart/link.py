@@ -326,6 +326,15 @@ class LWLink2:
     async def async_force_reconnect(self, secs):
         self._ws.async_force_reconnect(secs)
 
+    async def async_deactivate(self):
+        await self._ws.async_deactivate()
+        
+    async def async_activate(self, max_tries=None, force_keep_alive_secs=0, source="link-activate", connect_callback=None):
+        self._ws.activate()
+        connected = await self.async_connect(max_tries, force_keep_alive_secs, source, connect_callback)
+        if not connected:
+            await self._ws.async_deactivate()
+        return connected
 
     #########################################################
     # Convenience methods for non-async calls

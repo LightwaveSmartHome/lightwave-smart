@@ -3,21 +3,16 @@ import uuid
 import datetime
 import aiohttp
 import logging
+import traceback
 from .message import LW_WebsocketMessage, LW_WebsocketMessageBatch
+from .utils import LWConnectionException
 
 _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
 
 MAX_PENDING_ITEMS = 2000
-
-VERSION = "1.6.9"
-CLIENT_ID_PREFIX = "3"
-
-PUBLIC_AUTH_SERVER = "https://auth.lightwaverf.com/token"
-AUTH_SERVER = "https://auth.lightwaverf.com/v2/lightwaverf/autouserlogin/lwapps"
+CLIENT_ID_PREFIX = "4"
 TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
-
-#TODO adapt async_connect calls to respond to connection failure
 
 
 class PendingItemsManager:
@@ -55,20 +50,11 @@ class PendingItemsManager:
 
 
 class LWWebsocket:
-    def __init__(self, username=None, password=None, auth_method="username", api_token=None, refresh_token=None, device_id=None):
-        self._active = None
+    def __init__(self, auth, device_id=None):
+        self._auth = auth
         
-        self._authtoken = None
-
-        self._username = username
-        self._password = password
-
-        self._auth_method = auth_method
-        self._api_token = api_token
-        self._refresh_token = refresh_token
-
-        self._session = aiohttp.ClientSession()
-        self._token_expiry = None
+        self._active = None
+        self._session = None
 
         self._eventHandlers = {}
 
@@ -88,14 +74,18 @@ class LWWebsocket:
 
     async def async_sendmessage(self, message, redact = False, immediate = False):
         if not self._websocket or self._websocket.closed:
-            _LOGGER.info("async_sendmessage: Websocket closed, reconnecting")
-            await self.async_connect(source="async_sendmessage")
-            _LOGGER.info("async_sendmessage: Connection reopened")
+            _LOGGER.info(f"async_sendmessage ({id(self)}): Websocket closed, reconnecting")
+            connected = await self.async_connect(source="async_sendmessage")
+            if not connected:
+                _LOGGER.error(f"async_sendmessage ({id(self)}): Cannot connect, aborting")
+                raise LWConnectionException(f"Cannot connect, aborting", retry=False)
+            
+            _LOGGER.info(f"async_sendmessage ({id(self)}): Connection reopened")
 
         if redact:
-            _LOGGER.debug("async_sendmessage: [contents hidden for security]")
+            _LOGGER.debug(f"async_sendmessage ({id(self)}): [contents hidden for security]")
         else:
-            _LOGGER.debug("async_sendmessage: Sending: %s", message.json())
+            _LOGGER.debug(f"async_sendmessage ({id(self)}): Sending: %s", message.json())
 
         return await self._queue_or_send_message(message, immediate)
 
@@ -108,10 +98,10 @@ class LWWebsocket:
             await self._websocket.send_str(json)
             
             transaction_id = message._message["transactionId"]
-            _LOGGER.debug(f"_send_message_to_websocket: Message sent - TranId: {transaction_id}")
+            _LOGGER.debug(f"_send_message_to_websocket ({id(self)}): Message sent - TranId: {transaction_id}")
         
         except Exception as exp:
-            _LOGGER.error(f"_send_message_to_websocket: Exception: {str(exp)}")
+            _LOGGER.error(f"_send_message_to_websocket ({id(self)}): Exception: {str(exp)}")
 
             
     async def _queue_or_send_message(self, message, immediate = False):
@@ -186,11 +176,11 @@ class LWWebsocket:
                 continue
             
             except asyncio.CancelledError:
-                _LOGGER.warning(f"{logPre}:  Task cancelled")
-                if message:
+                _LOGGER.warning(f"{logPre}:  Task cancelled - active: {self._active}")
+                if message and self._active:
                     # If a message was retrieved before cancellation, put it back in the queue
                     await self._transaction_queue.put(message)
-                    message = None
+                message = None
                 continue
             
             except Exception as exp:
@@ -205,8 +195,12 @@ class LWWebsocket:
             _LOGGER.debug(f"{logPre} (priority: {message.priority}) - tranId: {message._message['transactionId']} - cl/op: {message.opclass}/{message.operation} - pending items: {self._pending_items_manager.count}, queue size: {self._transaction_queue.qsize()}")
             await self._send_message_to_websocket(message)
 
-            await asyncio.sleep(0.01)
+            try:
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                _LOGGER.warning(f"{logPre}:  Sleep cancelled")
                 
+        _LOGGER.debug(f"{logPre}: Ending")                
 
     async def _consumer_handler(self):
         logPre = f"consumer_handler ({id(self)})"
@@ -214,7 +208,6 @@ class LWWebsocket:
         while self._active:
             try:
                 mess = await self._websocket.receive()
-                _LOGGER.debug(f"{logPre}: Received: {mess}")
             except AttributeError:  
                 # websocket is None if not set up, just wait for a while
                 _LOGGER.debug(f"{logPre}: Websocket not ready, sleeping for 3 seconds")
@@ -282,7 +275,6 @@ class LWWebsocket:
                 self._websocket = None
                 await self.clean_up()
                 
-                #self._authtoken = None
                 asyncio.ensure_future(self.async_connect(source="consumer_handler"))
                 # self.connect()
                 _LOGGER.info(f"{logPre}: Websocket reconnect requested")
@@ -305,32 +297,44 @@ class LWWebsocket:
     #########################################################
     # Connection
     #########################################################
-    async def async_deactivate(self):
-        _LOGGER.info(f"async_deactivate ({id(self)}): Deactivating - {len(self.background_tasks)} background tasks will be cancelled")
+    async def async_deactivate(self, source=None):
+        if self._active:
+            _LOGGER.info(f"async_deactivate ({id(self)}/{source}): Deactivating - {len(self.background_tasks)} background tasks will be cancelled")
+        else:
+            _LOGGER.warning(f"async_deactivate ({id(self)}/{source}): Not active")
+            return
         
         self._active = None
         await self.clean_up()
         self._connect_callbacks = []
         
+        tasks_to_cancel = []
+        while self.background_tasks:
+            task = self.background_tasks.pop()
+            tasks_to_cancel.append(task)
+            task.cancel()
+        
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+                        
         if self._websocket:
             await self._websocket.close()
-            self._websocket = None
+        self._websocket = None
         
         if self._session:
             await self._session.close()
         self._session = None
         
-        while self.background_tasks:
-            task = self.background_tasks.pop()
-            task.cancel()
         
-    def activate(self):
+    def activate(self, source=None):
         if self._active:
-            _LOGGER.warning(f"activate ({id(self)}): Already active")
+            _LOGGER.warning(f"activate ({source}/{id(self)}): Already active")
             return
         
-        _LOGGER.info(f"activate ({id(self)}): Activating")
+        _LOGGER.info(f"activate ({source}/{id(self)}): Activating")
         self._active = True
+        
+        self._session = aiohttp.ClientSession()
         
         task = asyncio.create_task(self._consumer_handler())
         self.background_tasks.add(task)
@@ -352,40 +356,38 @@ class LWWebsocket:
             tran_message.complete()                 # will be called potentially multiple times for the same message
         self._pending_items_manager.clear()
 
-    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source=None, connect_callback=None):
+    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source=None):
+        logPre = f"async_connect ({id(self)}/{source}):"
         if not self._active:
-            _LOGGER.error(f"async_connect ({id(self)}/{source}): Not active")
+            _LOGGER.error(f"{logPre} Not active")
             return False
         
         if self._connectingTS:
-            _LOGGER.warning(f"async_connect ({id(self)}/{source}): Connecting already in progress as of {self._connectingTS} - skipping")
+            _LOGGER.warning(f"{logPre} Connecting already in progress as of {self._connectingTS} - skipping")
             return False
         
-        _LOGGER.info(f"async_connect ({id(self)}/{source}): - Connecting...")
+        _LOGGER.info(f"{logPre} - Connecting...")
         self._connectingTS = datetime.datetime.now()
         
         connected = False
         authenticated = False
         try:
-            if connect_callback:
-                self.register_connect_callback(connect_callback)
-            
             connected = await self._connect_to_server(max_tries, source)
             if not connected:
-                _LOGGER.error(f"async_connect ({source}): Cannot connect - aborting after: {datetime.datetime.now() - self._connectingTS}")
+                _LOGGER.error(f"{logPre} Cannot connect - aborting after: {datetime.datetime.now() - self._connectingTS}")
             else:
                 authenticated = await self._authenticate(max_tries, force_keep_alive_secs, source)
 
                 if authenticated:
-                    _LOGGER.info(f"async_connect ({source}): Connected and Authenticated - after: {datetime.datetime.now() - self._connectingTS}")
+                    _LOGGER.info(f"{logPre} Connected and Authenticated - after: {datetime.datetime.now() - self._connectingTS}")
                     if self._connect_callbacks:
                         for callback in self._connect_callbacks:
                             await callback()
                 else:
-                    _LOGGER.error(f"async_connect ({source}): Cannot authenticate - aborting after: {datetime.datetime.now() - self._connectingTS}")
+                    _LOGGER.error(f"{logPre} Cannot authenticate - aborting after: {datetime.datetime.now() - self._connectingTS}")
                 
         except Exception as exp:
-            _LOGGER.error(f"async_connect ({source}): Connected: {connected} - Authenticated: {authenticated} - Exception: {str(exp)}")
+            _LOGGER.error(f"{logPre} Connected: {connected} - Authenticated: {authenticated} - Exception: {str(exp)}")
             
         if not connected or not authenticated:
             if self._websocket:
@@ -419,9 +421,14 @@ class LWWebsocket:
                 else:
                     retryMsg = 'Not authenticated'
                 
+            except LWConnectionException as exp:
+                if exp.retry == False:
+                    _LOGGER.warning(f"_authenticate ({source}): Unrecoverable error - Attempt {attempt} - exception: '{repr(exp)}'")
+                    break
+                    
             except Exception as exp:
                 retryMsg = 'Exception'
-                details = f" - exception: '{repr(exp)}'"
+                details = f" - exception: '{repr(exp)} - {traceback.format_exc()}'"
             
             if attempt >= max_auth_retries:
                 break
@@ -466,6 +473,7 @@ class LWWebsocket:
                 # Session state error - recreate session and continue
                 retryMsg = f"InvalidStateError"
                 details = f" - recreating session"
+                await self._session.close()
                 self._session = aiohttp.ClientSession()
             
             except (aiohttp.ClientError, aiohttp.ClientConnectorError, aiohttp.ClientConnectionError, ConnectionRefusedError, OSError) as exp:
@@ -487,84 +495,47 @@ class LWWebsocket:
     async def _authenticate_websocket(self, source = None, retrying = False):
         # return True if authenticated, False if failed, None if no authtoken
         
-        if not self._authtoken:
-            await self._get_access_token()
+        access_token = await self._auth.async_get_access_token()
             
-        if self._authtoken:
+        if access_token:
             authmess = LW_WebsocketMessage("user", "authenticate")
-            authmess.add_item({"token": self._authtoken, "clientDeviceId": self._device_id})
+            authmess.add_item({"token": access_token, "clientDeviceId": self._device_id})
             
             responses = await self.async_sendmessage(authmess, redact = True, immediate = True)
             if responses and responses[0] and not responses[0]["success"]:
-                if responses[0]["error"]["code"] == "200":
+                error = responses[0]["error"]
+                error_code = error["code"]
+                error_message = error["message"]
+                _LOGGER.warning(f"authenticate_websocket ({id(self)}): Authentication error: {error}")
+                
+                retry_reason = None
+                if error_code == "200":
                     # "Channel is already authenticated" - Do nothing
                     pass
                 
-                elif responses[0]["error"]["code"] == 405:
+                elif error_code == 405:
                     # "Access denied" - bogus token, let's reauthenticate
                     # Lightwave seems to return a string for 200 but an int for 405!  TODO - fix
-                    self._authtoken = None
-                    if retrying:
-                        return False
+                    retry_reason = "rejected (405)"
                     
-                    _LOGGER.info("authenticate_websocket: Authentication token rejected, regenerating and reauthenticating")
-                    return await self._authenticate_websocket('405', True)
-                    
-                elif responses[0]["error"]["message"] == "user-msgs: Token not valid/expired.":
-                    self._authtoken = None
-                    if retrying:
-                        return False
-                    
-                    _LOGGER.info("authenticate_websocket: Authentication token expired, regenerating and reauthenticating")
-                    return await self._authenticate_websocket('expired', True)
+                elif error_message == "user-msgs: Token not valid/expired.":
+                    retry_reason = "expired"
                     
                 else:
-                    _LOGGER.warning("authenticate_websocket: Unhandled authentication error {}".format(responses[0]["error"]))
+                    _LOGGER.warning(f"authenticate_websocket: Unhandled authentication error")
                     return False
+
+                if retry_reason:
+                    retry_allowed = self._auth.invalidate_access_token()
+                    if retrying or not retry_allowed:
+                        return False
+                    
+                    _LOGGER.info(f"authenticate_websocket ({id(self)}): Authentication token {retry_reason}, regenerating and reauthenticating")
+                    return await self._authenticate_websocket(source=retry_reason, retrying=True)
                     
             return True
         else:
             return None
-
-    async def _get_access_token(self):
-        if self._auth_method == "username":
-            await self._get_access_token_username()
-        elif self._auth_method == "api":
-            await self._get_access_token_api()
-        else:
-            raise ValueError("auth_method must be 'username' or 'api'")
-
-    async def _get_access_token_username(self):
-        _LOGGER.debug("get_access_token_username: Requesting authentication token (using username and password)")
-        authentication = {"email": self._username, "password": self._password, "version": VERSION}
-        async with self._session.post(AUTH_SERVER, headers={"x-lwrf-appid": "ios-01"}, json=authentication) as req:
-            if req.status == 200:
-                _LOGGER.debug("get_access_token_username: Received response: [contents hidden for security]")
-                #_LOGGER.debug("get_access_token_username: Received response: {}".format(await req.json()))
-                self._authtoken = (await req.json())["tokens"]["access_token"]
-            elif req.status == 404:
-                _LOGGER.warning("get_access_token_username: Authentication failed - if network is ok, possible wrong username/password")
-                self._authtoken = None
-            else:
-                _LOGGER.warning("get_access_token_username: Authentication failed - status {}".format(req.status))
-                self._authtoken = None
-
-    # TODO check for token expiry
-    async def _get_access_token_api(self):
-        _LOGGER.debug("get_access_token_api: Requesting authentication token (using API key and refresh token)")
-        authentication = {"grant_type": "refresh_token", "refresh_token": self._refresh_token}
-        async with self._session.post(PUBLIC_AUTH_SERVER,
-                            headers={"authorization": "basic " + self._api_token},
-                            json=authentication) as req:
-            _LOGGER.debug("get_access_token_api: Received response: [contents hidden for security]")
-            #_LOGGER.debug("get_access_token_api: Received response: {}".format(await req.text()))
-            if req.status == 200:
-                self._authtoken = (await req.json())["access_token"]
-                self._refresh_token = (await req.json())["refresh_token"]
-                self._token_expiry = datetime.datetime.now() + datetime.timedelta(seconds=(await req.json())["expires_in"])
-            else:
-                _LOGGER.warning("get_access_token_api: No authentication token (status_code '{}').".format(req.status))
-                raise ConnectionError("No authentication token: {}".format(await req.text()))
 
     #########################################################
     # Convenience methods for non-async calls

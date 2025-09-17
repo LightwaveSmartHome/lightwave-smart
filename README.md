@@ -1,191 +1,133 @@
-Python library to provide reliable communication with Lightwave Smart Series (second generation) devices.  Including lights (dimmers), power outlets (sockets), smart switchs (wirefrees), PIRs, thermostats, TRVs, magnetic switches, relays, energy monitors and other device types.
+# Lightwave Smart Python Library
 
-## Notes
-**The LWLink2Public class should not be used in this version, it has not been tested.**
+[![PyPI version](https://badge.fury.io/py/lightwave_smart.svg)](https://badge.fury.io/py/lightwave_smart)
+[![Python 3.7+](https://img.shields.io/badge/python-3.7+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-## Installing
+A Python library for controlling Lightwave (https://lightwaverf.com) Smart Series (second generation) devices as well as Connect Series (first generation) devices connected to a Link Plus hub.
+Control and monitor lights (dimmers), power outlets (sockets), smart switches (wirefrees), PIRs, thermostats, TRVs, magnetic switches, relays, energy monitors and other device types.
 
-The easiest way is 
+Supported devices include:
++ [Link Plus hub](https://shop.lightwaverf.com/collections/all/products/link-plus) (required)
++ [Light Switches / Dimmers](https://shop.lightwaverf.com/collections/smart-lighting)
++ [Power Outlets](https://shop.lightwaverf.com/collections/smart-sockets)
++ [Smart Switches](https://shop.lightwaverf.com/collections/scene-selectors)
++ [TRVs and Thermostats](https://shop.lightwaverf.com/collections/smart-heating)
++ [Relays and LED Drivers](https://shop.lightwaverf.com/collections/relays-and-led-drivers)
++ And more...
 
-    pip3 install lightwave_smart
+## Updates
 
-Or just copy https://raw.githubusercontent.com/LightwaveSmartHome/lightwave-smart/master/lightwave_smart/lightwave_smart.py into your project
+**Important**: The `LWLink2Public` class has been removed as of version 1.0.0.
 
-## Using the library
+## Installation
 
-### Imports
-You'll need to import the library
+```bash
+pip install lightwave_smart
+```
 
-    from lightwave_smart import lightwave_smart
+## Quick Start
 
-If you want to see all the messages passed back and forth with the Lightwave servers, set the logging level to debug:
+```python
+import asyncio
+from lightwave_smart import lightwave_smart
 
-    import logging
-    logging.basicConfig(level=logging.DEBUG)
+async def main():
+    # Create and authenticate
+    link = lightwave_smart.LWLink2()
+    link.auth.set_auth_method(auth_method="password", username="your_email@example.com", password="your_password")
+    await link.async_activate()
     
-### Connecting
-Start by authenticating with the LW servers.
-
-    link = lightwave_smart.LWLink2("example@example.com", "password")
+    # Get devices and feature sets
+    await link.async_get_hierarchy()
     
-This sets up a `LWLink2` object called `link`, and gets an authentication token from LW which is stored in the object. We can now connect to the LW websocket service    
-        
-    link.connect()
-
-### Read hierarchy
-Next:
-
-    link.get_hierarchy()
+    # List feature sets
+    for featureset in link.featuresets.values():
+        device = featureset.device
+        print(f"{featureset.name} (ID: {featureset.featureset_id}), Device Product Code: {device.product_code}")
     
-This requests the LW server to tell us all of the registered "featuresets". A "featureset" is LW's word for a group of features (e.g. a light switch could have features for "power" and "brightness") - this is what I think of as a device, but that's not how LW describes them (sidenote: what LW considers to be a device depends on the generation of the hardware - for gen 1 hardware, devices and featuresets correspond, for gen2 a device corresponds to a physical object; e.g. a 2 gang switch is a single device, but 2 featuresets).
-
-Running `get_hierarchy` populates a dictionary of all of the featuresets available. the dictionary keys are unique identifiers provided by LW, the values are `LWRFFeatureSet` objects that hold information about the featureset.
-
-To see the objects:
-
-    print(link.featuresets)
+    # Control a light
+    featureset_id = "your-feature-set-id"
+    await link.async_turn_on_by_featureset_id(featureset_id)
+    await link.async_set_brightness_by_featureset_id(featureset_id, 75)
     
-For a slightly more useful view: 
-    
-    for i in link.featuresets.values():
-        print(i.name, i.featureset_id, i.features)
+    await link.async_deactivate()
 
-In my case this returns
+asyncio.run(main())
+```
 
-    Garden Room 5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e {'switch': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C93A0>, 'protection': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C9AC0>, 'dimLevel': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C9B50>, 'identify': <lightwave_smart.lightwave_smart.LWRFFeature object at 0x0000021DB49C9BB0>}
+## Key Concepts
 
-This is a light switch with the name `Garden Room` and the featureset id `5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e` which we'll use in the example. The features will be explained below.
+- **Devices**: Physical devices (light switches, thermostats, etc.)
+- **Feature Sets**: Logical groupings within a device (e.g. a 2-circuit switch has 2 feature sets)
 
-### Reading the featuresets
+## Device Control
 
-Featuresets are accessed from the dictionary directly:
+### Basic Control
+```python
+# Lights/Switches
+await link.async_turn_on_by_featureset_id(featureset_id)
+await link.async_turn_off_by_featureset_id(featureset_id)
+await link.async_set_brightness_by_featureset_id(featureset_id, 50)
 
-##### Name
-    print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].name)
-    
-will give the name you assigned when you set up the device in the LW app. 
+# Thermostats
+await link.async_set_temperature_by_featureset_id(featureset_id, 22.5)
 
-##### Type of device    
+# Covers/Blinds
+await link.async_cover_open_by_featureset_id(featureset_id)
+await link.async_cover_close_by_featureset_id(featureset_id)
+```
 
-There are a number of methods to return info about the devices
+### Device Type Detection
+```python
+device = link.featuresets['featureset-id'].device
+print(f"Is light: {device.is_light()}")
+print(f"Is climate: {device.is_climate()}")
+print(f"Is switch: {device.is_switch()}")
+```
 
-|Method|Usage|
-|---|---|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_switch())|Is it a socket?|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_light())|Light switches|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_climate())|Thermostats|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_cover())|Blinds / three-way relay|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_climate())|Thermostats|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_energy())|Energy meters|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_windowsensor())|Window sensor|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_hub())|LinkPlus Hub|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].is_gen2())|Generation 2 device?|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].reports_power())|Has power reporting|
-|print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].has_led())|Has an indicator LED that is configurable|
+### Event Callbacks
+```python
+def feature_changed(**kwargs):
+    # example output for a switch:
+    # {'feature': 'switch', 'feature_id': 'your-feature-set-id', 'prev_value': 0, 'new_value': 1}
+    print(f"Feature changed: {kwargs}")
 
-##### Device features
+# Register callback
+await link.async_register_feature_callback(featureset_id, feature_changed)
+```
 
-This is how we find out the state of the device, and we will also use this information to control the device:
+## API Reference
 
-    print(link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].features)
+### Core Methods
+- `async_activate()` - Connect to Lightwave servers
+- `async_get_hierarchy()` - Get all devices and feature sets, reads and updates all features states in the background
 
-`features` is a dictionary of the features within a given featureset. The keys are the names of the features, the values are LWRFFeature objects.
+After calling `async_get_hierarchy` all feature known at that time will have their states updated as they change based on events received from the websocket.
 
-The LWRFFeature objects have properties: featureset, id, name, state. E.g.
+### Device Control
+- `async_turn_on_by_featureset_id(id)` - Turn device on
+- `async_turn_off_by_featureset_id(id)` - Turn device off
+- `async_set_brightness_by_featureset_id(id, level)` - Set brightness (0-100)
+- `async_set_temperature_by_featureset_id(id, temp)` - Set temperature
 
-    for i in link.featuresets['5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e'].features.values():
-        print(i.name, i.id, i.state)
+### Device Information
+- `is_light()`, `is_climate()`, `is_switch()`, `is_cover()`, `is_energy()` - Device type checks
+- `is_gen2()`, `is_hub()`, `is_trv()` - Specific device checks
 
-returns
+## Examples
 
-    switch 5bc4d06e87779374d29d7d9a-28-3157334318+1 0
-    protection 5bc4d06e87779374d29d7d9a-29-3157334318+1 0
-    dimLevel 5bc4d06e87779374d29d7d9a-30-3157334318+1 59
-    identify 5bc4d06e87779374d29d7d9a-72-3157334318+1 0
+- `example_readme.py` - Basic synchronous usage
+- `example_async.py` - Advanced async usage with callbacks
 
-showing the light is currently off (feature `switch`), the physical buttons are not locked (feature `protection`) and the brightness is set to 59% (feature `dimlevel`).
+## Contributing
 
-#### More reading the featuresets
+Contributions welcome! Fork, create a feature branch, commit changes, and submit a PR.
 
-The values of the featuresets are static and won't respond to changes in the state of the physical device (unless you set up a callback to handle messages from the server). If you want to make sure the values are up to date you can: 
+## License
 
-    link.update_featureset_states()
-
-Finally there are a handful of convenience methods if you just want to return devices of a particular type:
-
-    print(link.get_switches())
-    print(link.get_lights())
-    print(link.get_climates())
-    print(link.get_energy())
-
-#### Writing to a feature
-Turning on a switch/light, turning off a switch/light or setting the brightness level for a light is as follows:
-
-    link.turn_on_by_featureset_id("5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e") 
-    link.turn_off_by_featureset_id("5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e") 
-    link.set_brightness_by_featureset_id("5bc4d06e87779374d29d7d9a-5bc4d61387779374d29fdd1e", 60) #Brightness in percent
-    
-Then there is one more method for a thermostat
-    
-    link.set_temperature_by_featureset_id(featureset_id, level)
-
-And some methods for covers (blinds)
-
-    link.cover_open_by_featureset_id(featureset_id)
-    link.cover_close_by_featureset_id(featureset_id)
-    link.cover_stop_by_featureset_id(featureset_id)
-
-#### Reading/writing to an arbitrary feature
-
-Finally, for any other features you might want to read or write the value of, you can access them directly. Note that the first option needs the **feature** unique id.
-    
-    link.read_feature(feature_id)
-
-or
-
-    link.featuresets[featureset_id].features[featurename].state
-
-Writing:
-
-    link.write_feature(feature_id, value)
-
-or
-
-    link.write_feature_by_name(featureset_id, featurename, value)
-
-or
-
-    await link.featuresets[featureset_id].features[featurename].set_state(value) #async only, see below
-    
-#### Getting notified when something changes
-
-This library is all using async programming, so notifications will only really work if your code is also async and is managing the event loop. Nonetheless, you can try the following for an idea of how to get a callback when an event is spotted by the server:
-
-    import asyncio
-    
-    def test():
-         print("this is a test callback")
-    
-    asyncio.get_event_loop().run_until_complete(link.async_register_callback(test))
-    
-This will call the `test` function every time a change is detected to the state of one of the features. This is likely only useful if you then run `link.update_featureset_states()` to ensure the internal state of the object is consistent with your actual LW system.
-
-See example_async.py for a minimal client.
-
-#### async methods
-
-The library is actually all built on async methods (the sync versions described above are just wrappers for the async versions)
-
-    async_connect()
-    async_get_hierarchy()
-    async_update_featureset_states()
-    async_write_feature(feature_id, value)
-    async_read_feature(feature_id)
-    async_turn_on_by_featureset_id(featureset_id)
-    async_turn_off_by_featureset_id(featureset_id)
-    async_set_brightness_by_featureset_id(featureset_id, level)
-    async_set_temperature_by_featureset_id(featureset_id, level)
+MIT License - see [LICENSE](LICENSE) file.
 
 ## Thanks
 
-Credit to Bryan Blunt for the original version https://github.com/bigbadblunt/lightwave2
+Credit to Bryan Blunt for the original version: https://github.com/bigbadblunt/lightwave2

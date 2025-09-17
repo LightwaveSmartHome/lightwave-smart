@@ -5,14 +5,17 @@ import traceback
 from .websocket import LWWebsocket
 from .message import LW_WebsocketMessage
 from .device import LWRFDevice, LWRFFeatureSet, LWRFFeature, LWRFUiIOMapFeature, LWRFUiButtonFeature
+from .auth import LWAuth
 
 _LOGGER = logging.getLogger(__name__)
 
 RGB_FLOOR = int("0x0", 16) #Previously the Lightwave app floored RGB values, but it doesn't any more
 
 class LWLink2:
-    def __init__(self, username=None, password=None, auth_method="username", api_token=None, refresh_token=None, device_id=None):
-        self._ws = LWWebsocket(username, password, auth_method, api_token, refresh_token, device_id)
+    def __init__(self, device_id=None, auth=None):
+        self.auth = auth if auth else LWAuth()
+        
+        self._ws = LWWebsocket(self.auth, device_id)        
         
         self.structures = {}    # structureId -> {linkPlus_featureset_id, name}
         
@@ -320,20 +323,37 @@ class LWLink2:
         else:
             _LOGGER.warning(f"async_register_firmware_event_callback: Device not found: {device_id}")
 
-    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source="link-async_connect", connect_callback=None):
-        return await self._ws.async_connect(max_tries, force_keep_alive_secs, source, connect_callback)
+    async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source="link-async_connect"):
+        return await self._ws.async_connect(max_tries, force_keep_alive_secs, source)
 
     async def async_force_reconnect(self, secs):
         self._ws.async_force_reconnect(secs)
 
-    async def async_deactivate(self):
-        await self._ws.async_deactivate()
+    async def async_deactivate(self, source="link-deactivate"):
+        if self._background_tasks:
+            _LOGGER.debug(f"async_deactivate ({source}): Cancelling {len(self._background_tasks)} LWLink2 background tasks")
+            tasks_to_cancel = []
+            while self._background_tasks:
+                task = self._background_tasks.pop()
+                tasks_to_cancel.append(task)
+                task.cancel()
+            
+            if tasks_to_cancel:
+                await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+        
+        await self.auth.close()
+        
+        await self._ws.async_deactivate(source)
         
     async def async_activate(self, max_tries=None, force_keep_alive_secs=0, source="link-activate", connect_callback=None):
-        self._ws.activate()
-        connected = await self.async_connect(max_tries, force_keep_alive_secs, source, connect_callback)
+        self._ws.activate(source=source)
+        
+        if connect_callback:
+            self._ws.register_connect_callback(connect_callback)
+        
+        connected = await self.async_connect(max_tries, force_keep_alive_secs, source)
         if not connected:
-            await self._ws.async_deactivate()
+            await self._ws.async_deactivate(f'link-activate-not-connected-{source}')
         return connected
 
     #########################################################

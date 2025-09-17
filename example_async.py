@@ -1,41 +1,33 @@
-from lightwave_smart import lightwave_smart
-import logging
 import asyncio
+from lightwave_smart import lightwave_smart
+from logging import basicConfig, INFO
+from logging import getLogger
 
-USER = None
-PASSWORD = None
+basicConfig(level=INFO) # Set logging level to INFO
+_LOGGER = getLogger(__name__)
 
-logging.basicConfig(level=logging.DEBUG)
-
-user = USER if USER else input("Enter username: ")
-password = PASSWORD if PASSWORD else input("Enter password: ")
-
-#Define a callback function. The callback receives 4 pieces of information:
-#feature, feature_id, prev_value, new_value
-def alert(**kwargs):
-    print("Callback received: {}".format(kwargs))
+def feature_changed(**kwargs):
+    _LOGGER.info(f"Feature changed: {kwargs}")
 
 async def main():
-    #Following three lines are minimal requirement to initialise a connection
-    #This will start up a background consumer_handler task that will run as long as the event loop is active
-    #This will keep the states synchronised with the real world, and reconnect if the connection drops
-    link = lightwave_smart.LWLink2(user, password)
-    await link.async_connect()
+    link = lightwave_smart.LWLink2()
+    link.auth.set_auth_method(auth_method="password", username="your_email@example.com", password="your_password")
+    await link.async_activate()
     await link.async_get_hierarchy()
+    
+    # Register callback for state changes
+    # only register the last featureset for this example
+    last_featureset = None
+    for featureset in link.featuresets.values():
+        last_featureset = featureset
+    if last_featureset:
+        _LOGGER.info(f"Registering callback for Feature Set: {last_featureset.name} (ID: {last_featureset.featureset_id}, Device ID: {last_featureset.device.device_id}, Product Code: {last_featureset.device.product_code})")
+        await link.async_register_feature_callback(last_featureset.featureset_id, feature_changed)
+    else:
+        _LOGGER.warning("No featuresets found")
 
-    #Following is optional, the background task will call the callback function where a change of state is detected
-    await link.async_register_callback(alert)
-
-#Dummy main program logic
-async def process_loop():
-    n = 1
+    # Keep running to receive updates
     while True:
-        print(f"{n}")
-        await asyncio.sleep(2)
-        n = n+1
+        await asyncio.sleep(1)
 
-loop = asyncio.get_event_loop()
-loop.run_until_complete(main())
-loop.run_until_complete(process_loop())
-
-
+asyncio.run(main())

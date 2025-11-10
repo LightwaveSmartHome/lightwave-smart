@@ -387,7 +387,7 @@ class LWWebsocket:
                     _LOGGER.error(f"{logPre} Cannot authenticate - aborting after: {datetime.datetime.now() - self._connectingTS}")
                 
         except Exception as exp:
-            _LOGGER.error(f"{logPre} Connected: {connected} - Authenticated: {authenticated} - Exception: {str(exp)}")
+            _LOGGER.error(f"{logPre} Connected: {connected} - Authenticated: {authenticated} - Exception: {repr(exp)} - {traceback.format_exc()}")
             
         if not connected or not authenticated:
             if self._websocket:

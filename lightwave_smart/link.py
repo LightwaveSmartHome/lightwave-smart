@@ -12,10 +12,10 @@ _LOGGER = logging.getLogger(__name__)
 RGB_FLOOR = int("0x0", 16) #Previously the Lightwave app floored RGB values, but it doesn't any more
 
 class LWLink2:
-    def __init__(self, device_id=None, auth=None):
+    def __init__(self, device_id=None, auth=None, client_version=None):
         self.auth = auth if auth else LWAuth()
         
-        self._ws = LWWebsocket(self.auth, device_id)        
+        self._ws = LWWebsocket(self.auth, device_id, client_version=client_version)        
         
         self.structures = {}    # structureId -> {linkPlus_featureset_id, name}
         

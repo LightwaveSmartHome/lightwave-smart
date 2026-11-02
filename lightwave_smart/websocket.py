@@ -11,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
 
 MAX_PENDING_ITEMS = 2000
-CLIENT_ID_PREFIX = "4"
+CLIENT_ID_PREFIX = "5"
 TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
 
 
@@ -50,8 +50,9 @@ class PendingItemsManager:
 
 
 class LWWebsocket:
-    def __init__(self, auth, device_id=None):
+    def __init__(self, auth, device_id=None, client_version=None):
         self._auth = auth
+        self._client_version = client_version
         
         self._active = None
         self._session = None
@@ -499,7 +500,10 @@ class LWWebsocket:
             
         if access_token:
             authmess = LW_WebsocketMessage("user", "authenticate")
-            authmess.add_item({"token": access_token, "clientDeviceId": self._device_id})
+            auth_item = {"token": access_token, "clientDeviceId": self._device_id}
+            if self._client_version:
+                auth_item["clientVersion"] = self._client_version
+            authmess.add_item(auth_item)
             
             responses = await self.async_sendmessage(authmess, redact = True, immediate = True)
             if responses and responses[0] and not responses[0]["success"]:

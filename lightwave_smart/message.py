@@ -63,6 +63,7 @@ class LW_WebsocketMessage:
         # either / or - todo - improve
         self.message_batch = message_batch
         self.future = asyncio.Future()
+        self._completed = False
         
     def __lt__(self, other: object) -> bool:
         return self.priority < other.priority        
@@ -171,14 +172,22 @@ class LW_WebsocketMessage:
     
     
     def complete(self):
-        # if self._waitflag:
-        if self.future:
-            self.future.set_result(self.item_responses)
-        if self.message_batch:
-            self.message_batch.message_complete(self)
-        
+        if self._completed:
+            _LOGGER.warning(
+                f"complete: ignoring second completion - tranId: {self.transcation_id} - pending: {len(self.pending_item_ids)}"
+            )
+        else:
+            self._completed = True
+            if self.future and not self.future.done():
+                self.future.set_result(self.item_responses)
+            elif self.future:
+                _LOGGER.warning(
+                    f"complete: future already done - tranId: {self.transcation_id} - pending: {len(self.pending_item_ids)}"
+                )
+            if self.message_batch:
+                self.message_batch.message_complete(self)
+
         self._waitflag.set()
-        # self._waitflag = None
 
     def json(self):
         return json.dumps(self._message)

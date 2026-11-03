@@ -270,15 +270,24 @@ class LWWebsocket:
                 except Exception as exp:
                     _LOGGER.warning(f"{logPre}: Error parsing message: {str(mess)} - Exception: {str(exp)}")
                     
-            elif mess.type == aiohttp.WSMsgType.CLOSED:
+            elif mess.type in (
+                aiohttp.WSMsgType.CLOSED,
+                aiohttp.WSMsgType.CLOSING,
+                aiohttp.WSMsgType.ERROR,
+            ):
                 # We're not going to get a response, so clear response flag to allow _send_message to unblock
-                _LOGGER.warning(f"{logPre}: Websocket closed")
+                _LOGGER.warning(
+                    f"{logPre}: Websocket {mess.type.name} - data: {mess.data!r} - extra: {mess.extra!r}"
+                )
                 self._websocket = None
-                await self.clean_up()
-                
-                asyncio.ensure_future(self.async_connect(source="consumer_handler"))
-                # self.connect()
-                _LOGGER.info(f"{logPre}: Websocket reconnect requested")
+                try:
+                    await self.clean_up()
+                except Exception:
+                    _LOGGER.exception(f"{logPre}: clean_up failed during {mess.type.name}")
+
+                if self._active:
+                    asyncio.ensure_future(self.async_connect(source="consumer_handler"))
+                    _LOGGER.info(f"{logPre}: Websocket reconnect requested")
 
     def register_event_handler(self, eventClass, callback, eventOperation=None):
         if eventClass not in self._eventHandlers:
@@ -336,26 +345,58 @@ class LWWebsocket:
         self._active = True
         
         self._session = aiohttp.ClientSession()
-        
-        task = asyncio.create_task(self._consumer_handler())
-        self.background_tasks.add(task)
-        # task.add_done_callback(self.background_tasks.discard)
-        
-        task = asyncio.create_task(self._process_transaction_queue())
-        self.background_tasks.add(task)
-        # task.add_done_callback(self.background_tasks.discard)
-    
-    async def clean_up(self):
-        while not self._transaction_queue.empty():
-            try:
-                message = await self._transaction_queue.get_nowait()
-                self._transaction_queue.task_done()
-            except asyncio.QueueEmpty:
-                break
 
-        for key, tran_message in self._pending_items_manager._pending_items.items():
-            tran_message.complete()                 # will be called potentially multiple times for the same message
-        self._pending_items_manager.clear()
+        self._start_background_task(self._consumer_handler, "consumer")
+        self._start_background_task(self._process_transaction_queue, "transaction_queue")
+
+    def _start_background_task(self, coro_fn, name):
+        task = asyncio.create_task(coro_fn(), name=name)
+        self.background_tasks.add(task)
+        task.add_done_callback(self._on_background_task_done)
+
+    def _on_background_task_done(self, task):
+        self.background_tasks.discard(task)
+        if task.cancelled() or not self._active:
+            return
+
+        name = task.get_name()
+        exc = task.exception()
+        _LOGGER.error(
+            f"background task {name} ({id(self)}) exited while active - exception: {exc!r}"
+        )
+        if name == "consumer":
+            _LOGGER.info(f"Restarting consumer handler ({id(self)})")
+            self._start_background_task(self._consumer_handler, "consumer")
+
+    async def clean_up(self):
+        already_finished = []
+        try:
+            seen = set()
+            for tran_message in self._pending_items_manager._pending_items.values():
+                if id(tran_message) in seen:
+                    continue
+                seen.add(id(tran_message))
+                if tran_message.future is not None and tran_message.future.done():
+                    already_finished.append(tran_message.transcation_id)
+                try:
+                    tran_message.complete()
+                except Exception:
+                    _LOGGER.exception(
+                        f"clean_up ({id(self)}): complete failed - tranId: {tran_message.transcation_id}"
+                    )
+        finally:
+            while not self._transaction_queue.empty():
+                try:
+                    self._transaction_queue.get_nowait()
+                    self._transaction_queue.task_done()
+                except asyncio.QueueEmpty:
+                    break
+            self._pending_items_manager.clear()
+
+        if already_finished:
+            _LOGGER.info(
+                f"clean_up ({id(self)}): {len(already_finished)} already-finished futures - tranIds: {already_finished}"
+            )
 
     async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source=None):
         logPre = f"async_connect ({id(self)}/{source}):"

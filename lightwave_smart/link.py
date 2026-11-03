@@ -51,16 +51,26 @@ class LWLink2:
                 
                 if feature is None:
                     _LOGGER.warning(f"_feature_event_handler: feature is None - feature_id: {feature_id}")
-                else:
-                    prev_value = feature.state
-                    
-                    feature.update_feature_state(value)
+                    continue
 
-                    for gen_func in self._callbacks:
-                        gen_func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+                prev_value = feature.state
 
-                
-                return feature
+                feature.update_feature_state(value)
+
+                for gen_func in self._callbacks:
+                    gen_func(feature=feature.name, feature_id=feature.id, prev_value = prev_value, new_value = value)
+
+                extra = ""
+                if feature.name in ("uiButton", "uiButtonPair"):
+                    decoded = feature.decode_ui_button_value(value, feature.name) if value else {}
+                    extra = f" - eventType: {decoded.get('eventType')} - presses: {decoded.get('presses')} - upDown: {decoded.get('upDown')}"
+                    if value and "eventType" not in decoded:
+                        _LOGGER.warning(
+                            f"_feature_event_handler: button value did not decode to an event type - feature_id: {feature.id} - type: {feature.name} - value: {value} - decoded: {decoded}"
+                        )
+                _LOGGER.debug(
+                    f"_feature_event_handler: feature_id: {feature.id} - type: {feature.name} - value: {value}{extra}"
+                )
 
     async def _firmware_event_handler_started(self, message):
         _LOGGER.debug("_firmware_event_handler_started: Event received - message: %s ", message)

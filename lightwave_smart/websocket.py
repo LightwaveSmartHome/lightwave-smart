@@ -11,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
 
 MAX_PENDING_ITEMS = 2000
-CLIENT_ID_PREFIX = "5"
+CLIENT_ID_PREFIX = "6"
 TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
 
 
@@ -75,13 +75,13 @@ class LWWebsocket:
 
     async def async_sendmessage(self, message, redact = False, immediate = False):
         if not self._websocket or self._websocket.closed:
-            _LOGGER.info(f"async_sendmessage ({id(self)}): Websocket closed, reconnecting")
+            _LOGGER.warning(f"async_sendmessage ({id(self)}): Websocket closed, reconnecting")
             connected = await self.async_connect(source="async_sendmessage")
             if not connected:
                 _LOGGER.error(f"async_sendmessage ({id(self)}): Cannot connect, aborting")
                 raise LWConnectionException(f"Cannot connect, aborting", retry=False)
             
-            _LOGGER.info(f"async_sendmessage ({id(self)}): Connection reopened")
+            _LOGGER.debug(f"async_sendmessage ({id(self)}): Connection reopened")
 
         if redact:
             _LOGGER.debug(f"async_sendmessage ({id(self)}): [contents hidden for security]")
@@ -277,7 +277,7 @@ class LWWebsocket:
             ):
                 # We're not going to get a response, so clear response flag to allow _send_message to unblock
                 _LOGGER.warning(
-                    f"{logPre}: Websocket {mess.type.name} - data: {mess.data!r} - extra: {mess.extra!r}"
+                    f"{logPre}: Websocket {mess.type.name}, reconnecting"
                 )
                 self._websocket = None
                 try:
@@ -287,7 +287,7 @@ class LWWebsocket:
 
                 if self._active:
                     asyncio.ensure_future(self.async_connect(source="consumer_handler"))
-                    _LOGGER.info(f"{logPre}: Websocket reconnect requested")
+                    _LOGGER.debug(f"{logPre}: Websocket reconnect requested")
 
     def register_event_handler(self, eventClass, callback, eventOperation=None):
         if eventClass not in self._eventHandlers:
@@ -421,7 +421,11 @@ class LWWebsocket:
                 authenticated = await self._authenticate(max_tries, force_keep_alive_secs, source)
 
                 if authenticated:
-                    _LOGGER.info(f"{logPre} Connected and Authenticated - after: {datetime.datetime.now() - self._connectingTS}")
+                    elapsed = datetime.datetime.now() - self._connectingTS
+                    if source in ("consumer_handler", "async_sendmessage"):
+                        _LOGGER.warning(f"{logPre} Websocket reconnected after: {elapsed}")
+                    else:
+                        _LOGGER.info(f"{logPre} Connected and Authenticated - after: {elapsed}")
                     if self._connect_callbacks:
                         for callback in self._connect_callbacks:
                             await callback()

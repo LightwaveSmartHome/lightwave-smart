@@ -31,6 +31,7 @@ class LWRFDevice:
         self._latest_firmware_release_id = None
         
         self.firmware_update_in_progress = False
+        self.room_name = None
         
     @property
     def name(self):
@@ -138,6 +139,7 @@ class LWRFFeatureSet:
         self.device = None
         
         self.features = {}
+        self.room_name = None
         
         self._event_callbacks = []
         

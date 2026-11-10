@@ -123,8 +123,30 @@ class LWLink2:
         task.add_done_callback(self._background_tasks.discard)
         
 
+    def _room_names_by_featureset(self, hierarchy_payload):
+        """Map a featureset id to its Lightwave room name.
+
+        Rooms come from the hierarchy payload. The structure root is not a room.
+        Missing room data leaves the map empty rather than using a device name.
+        """
+        rooms = hierarchy_payload.get("room") if isinstance(hierarchy_payload, dict) else None
+        if not isinstance(rooms, list):
+            return {}
+        names = {}
+        for room in rooms:
+            if not isinstance(room, dict):
+                continue
+            name = room.get("name")
+            if not isinstance(name, str) or not name.strip():
+                continue
+            for featureset_id in room.get("featureSets") or []:
+                names.setdefault(featureset_id, name.strip())
+        return names
+
     async def _async_read_groups(self):
         self.featuresets = {}
+        for device in self.devices.values():
+            device.room_name = None
         for groupId in self._group_ids:
             read_hierarchy = LW_WebsocketMessage("group", "hierarchy")
             read_hierarchy.add_item({"groupId": groupId})
@@ -151,9 +173,11 @@ class LWLink2:
             try:
                 devices = list(group_read_responses[0]["payload"]["devices"].values())
                 features = list(group_read_responses[0]["payload"]["features"].values())
-                featuresets = list(hierarchy_responses[0]["payload"]["featureSet"])
+                hierarchy_payload = hierarchy_responses[0]["payload"]
+                featuresets = list(hierarchy_payload["featureSet"])
+                room_names = self._room_names_by_featureset(hierarchy_payload)
                 
-                self.get_featuresets(featuresets, devices, features)
+                self.get_featuresets(featuresets, devices, features, room_names)
             except Exception as e:
                 _LOGGER.warning(f"_async_read_groups: groupId: {groupId} - does not have devices/features/featuresets - {group_read_responses} - {str(e)}")
 
@@ -333,6 +357,24 @@ class LWLink2:
         else:
             _LOGGER.warning(f"async_register_firmware_event_callback: Device not found: {device_id}")
 
+    @property
+    def connected(self):
+        """True while the websocket session is authenticated."""
+        return self._ws.connected
+
+    def register_connect_callback(self, callback):
+        self._ws.register_connect_callback(callback)
+
+    def unregister_connect_callback(self, callback):
+        self._ws.unregister_connect_callback(callback)
+
+    def register_disconnect_callback(self, callback):
+        """Register a callback for a drop after the link has been up."""
+        self._ws.register_disconnect_callback(callback)
+
+    def unregister_disconnect_callback(self, callback):
+        self._ws.unregister_disconnect_callback(callback)
+
     async def async_connect(self, max_tries=None, force_keep_alive_secs=0, source="link-async_connect"):
         return await self._ws.async_connect(max_tries, force_keep_alive_secs, source)
 
@@ -418,11 +460,16 @@ class LWLink2:
                 return x
         return None
 
-    def get_featuresets(self, featuresets, devices, features):
+    def get_featuresets(self, featuresets, devices, features, room_names=None):
+        if room_names is None:
+            room_names = {}
         for y in featuresets:
             new_featureset = LWRFFeatureSet()
             new_featureset.link = self
             new_featureset.featureset_id = y["groupId"]
+            room_name = room_names.get(new_featureset.featureset_id)
+            if room_name:
+                new_featureset.room_name = room_name
             
             device = None
             if y["deviceId"] in self.devices:
@@ -453,6 +500,8 @@ class LWLink2:
                     self.set_structure_data(device.device_id, new_featureset.featureset_id)
                     
             new_featureset.device = device
+            if new_featureset.room_name and not device.room_name:
+                device.room_name = new_featureset.room_name
             device.add_featureset(new_featureset)
                     
             new_featureset.name = y["name"]

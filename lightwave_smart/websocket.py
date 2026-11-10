@@ -11,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
 
 MAX_PENDING_ITEMS = 2000
-CLIENT_ID_PREFIX = "6"
+CLIENT_ID_PREFIX = "7"
 TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
 
 
@@ -64,6 +64,9 @@ class LWWebsocket:
         self._websocket = None
         self._connectingTS = None
         self._connect_callbacks = []
+        self._disconnect_callbacks = []
+        self._authenticated = False
+        self._suppress_disconnect = False
 
         self._transaction_queue = asyncio.PriorityQueue()
         self._pending_items_manager = PendingItemsManager()
@@ -74,8 +77,16 @@ class LWWebsocket:
         self.next_message_event = asyncio.Event()
 
     async def async_sendmessage(self, message, redact = False, immediate = False):
-        if not self._websocket or self._websocket.closed:
+        socket = self._websocket
+        if socket is None or socket.closed:
             _LOGGER.warning(f"async_sendmessage ({id(self)}): Websocket closed, reconnecting")
+            # Claim before the first await so the consumer cannot also own this socket.
+            if self._claim_closed_socket(socket):
+                await self._notify_disconnect()
+                try:
+                    await self.clean_up()
+                except Exception:
+                    _LOGGER.exception(f"async_sendmessage ({id(self)}): clean_up failed")
             connected = await self.async_connect(source="async_sendmessage")
             if not connected:
                 _LOGGER.error(f"async_sendmessage ({id(self)}): Cannot connect, aborting")
@@ -207,10 +218,15 @@ class LWWebsocket:
         logPre = f"consumer_handler ({id(self)})"
         _LOGGER.debug(f"{logPre}: Starting consumer handler")
         while self._active:
-            try:
-                mess = await self._websocket.receive()
-            except AttributeError:  
+            websocket = self._websocket
+            if websocket is None:
                 # websocket is None if not set up, just wait for a while
+                _LOGGER.debug(f"{logPre}: Websocket not ready, sleeping for 3 seconds")
+                await asyncio.sleep(3)
+                continue
+            try:
+                mess = await websocket.receive()
+            except AttributeError:
                 _LOGGER.debug(f"{logPre}: Websocket not ready, sleeping for 3 seconds")
                 await asyncio.sleep(3)
                 continue
@@ -275,15 +291,21 @@ class LWWebsocket:
                 aiohttp.WSMsgType.CLOSING,
                 aiohttp.WSMsgType.ERROR,
             ):
+                # A send may already have replaced this socket and reported the drop.
+                if not self._claim_closed_socket(websocket):
+                    _LOGGER.debug(
+                        f"{logPre}: Ignoring {mess.type.name} for a socket that is no longer current"
+                    )
+                    continue
                 # We're not going to get a response, so clear response flag to allow _send_message to unblock
                 _LOGGER.warning(
                     f"{logPre}: Websocket {mess.type.name}, reconnecting"
                 )
-                self._websocket = None
                 try:
                     await self.clean_up()
                 except Exception:
                     _LOGGER.exception(f"{logPre}: clean_up failed during {mess.type.name}")
+                await self._notify_disconnect()
 
                 if self._active:
                     asyncio.ensure_future(self.async_connect(source="consumer_handler"))
@@ -302,7 +324,66 @@ class LWWebsocket:
             self._eventHandlers[eventClass][None].append(callback)
 
     def register_connect_callback(self, callback):
-        self._connect_callbacks.append(callback)
+        if callback not in self._connect_callbacks:
+            self._connect_callbacks.append(callback)
+
+    def unregister_connect_callback(self, callback):
+        try:
+            self._connect_callbacks.remove(callback)
+        except ValueError:
+            return
+
+    def register_disconnect_callback(self, callback):
+        if callback not in self._disconnect_callbacks:
+            self._disconnect_callbacks.append(callback)
+
+    def unregister_disconnect_callback(self, callback):
+        try:
+            self._disconnect_callbacks.remove(callback)
+        except ValueError:
+            return
+
+    def _claim_closed_socket(self, socket):
+        """Detach socket if it is still current. Only one caller can own the close."""
+        if socket is None or self._websocket is not socket:
+            return False
+        self._websocket = None
+        return True
+
+    @property
+    def connected(self):
+        """True after authentication until the socket closes or the link is stopped."""
+        websocket = self._websocket
+        if not self._authenticated or websocket is None:
+            return False
+        return not websocket.closed
+
+    async def _notify_disconnect(self):
+        """Tell listeners a session that was up has dropped.
+
+        Startup, before the first successful authentication, does not notify.
+        async_deactivate suppresses this so an intentional stop is not an outage.
+        """
+        if self._suppress_disconnect or not self._authenticated:
+            self._authenticated = False
+            return
+        self._authenticated = False
+        for callback in list(self._disconnect_callbacks):
+            try:
+                result = callback()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                _LOGGER.exception(f"_notify_disconnect ({id(self)}): callback failed")
+
+    async def _notify_connect(self):
+        for callback in list(self._connect_callbacks):
+            try:
+                result = callback()
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception:
+                _LOGGER.exception(f"_notify_connect ({id(self)}): callback failed")
 
     #########################################################
     # Connection
@@ -314,9 +395,12 @@ class LWWebsocket:
             _LOGGER.warning(f"async_deactivate ({id(self)}/{source}): Not active")
             return
         
+        self._suppress_disconnect = True
+        self._authenticated = False
         self._active = None
         await self.clean_up()
         self._connect_callbacks = []
+        self._disconnect_callbacks = []
         
         tasks_to_cancel = []
         while self.background_tasks:
@@ -343,6 +427,8 @@ class LWWebsocket:
         
         _LOGGER.info(f"activate ({source}/{id(self)}): Activating")
         self._active = True
+        self._suppress_disconnect = False
+        self._authenticated = False
         
         self._session = aiohttp.ClientSession()
 
@@ -426,9 +512,8 @@ class LWWebsocket:
                         _LOGGER.warning(f"{logPre} Websocket reconnected after: {elapsed}")
                     else:
                         _LOGGER.info(f"{logPre} Connected and Authenticated - after: {elapsed}")
-                    if self._connect_callbacks:
-                        for callback in self._connect_callbacks:
-                            await callback()
+                    self._authenticated = True
+                    await self._notify_connect()
                 else:
                     _LOGGER.error(f"{logPre} Cannot authenticate - aborting after: {datetime.datetime.now() - self._connectingTS}")
                 

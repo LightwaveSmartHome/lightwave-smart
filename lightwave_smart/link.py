@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import time
 import traceback
 
 from .websocket import LWWebsocket
@@ -10,6 +11,44 @@ from .auth import LWAuth
 _LOGGER = logging.getLogger(__name__)
 
 RGB_FLOOR = int("0x0", 16) #Previously the Lightwave app floored RGB values, but it doesn't any more
+
+# A Link can authenticate before its devices answer feature reads.
+_LINK_REFRESH_DEBOUNCE_SECS = 2
+_LINK_REFRESH_ATTEMPTS = 3
+_LINK_REFRESH_RETRY_SECS = 5
+_LINK_OFFLINE_GRACE_SECS = 30
+# While the socket is settling or latched, device status reads and events wait.
+_LINK_STATUS_HELD = ("grace", "offline")
+
+
+def connected_since_ms(value):
+    """Socket generation in milliseconds. None when the event cannot be ordered."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        if value != value:
+            return None
+        return float(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            return float(text)
+        except ValueError:
+            return None
+    return None
+
+
+def link_id_from_combined_id(combined_id):
+    """Return the link id from structureId-thingId-linkId+factoryResets."""
+    if combined_id is None:
+        return None
+    parts = str(combined_id).split("-")
+    if len(parts) < 3 or not parts[2]:
+        return None
+    link_id = parts[2].split("+", 1)[0]
+    return link_id or None
 
 class LWLink2:
     def __init__(self, device_id=None, auth=None, client_version=None):
@@ -26,14 +65,25 @@ class LWLink2:
 
         self._callbacks = []
         
+        self._closing = False
         self._background_tasks = set()
+        self._link_refresh_ready_at = {}
+        self._link_refresh_tasks = {}
+        self._link_grace_tasks = {}
+        self._link_socket_state = {}
+        self._link_status_epoch = {}
+        self._link_connected_since = {}
+        self._link_restore_owed = set()
+        self._link_feature_cycle_seen = set()
 
         self._ws.register_event_handler("feature", self._feature_event_handler)
         self._ws.register_event_handler("group", self.async_get_hierarchy)
         # self._ws.register_event_handler("device", self.async_get_hierarchy)
+        self._ws.register_event_handler("deviceStatus", self._device_status_event_handler)
         
         self._ws.register_event_handler("server", self._firmware_event_handler_started, "sendingFirmwareStatus")
         self._ws.register_event_handler("server", self._firmware_event_handler_complete, "sendingFirmwareComplete")
+        self._ws.register_event_handler("system", self._link_socket_event_handler, "event")
 
     async def _feature_event_handler(self, message):
         _LOGGER.debug(f"_feature_event_handler: Event received - items: {len(message['items'])}")
@@ -92,6 +142,444 @@ class LWLink2:
                     
                 device.update_firmware_in_progress(False)
 
+    def _track_background(self, task):
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+    def _clear_link_socket_state(self):
+        """Drop per-link socket memory so a reused link can connect cleanly."""
+        self._link_socket_state.clear()
+        self._link_status_epoch.clear()
+        self._link_connected_since.clear()
+        self._link_restore_owed.clear()
+        self._link_feature_cycle_seen.clear()
+        self._link_refresh_ready_at.clear()
+        for task in list(self._link_grace_tasks.values()):
+            if not task.done():
+                task.cancel()
+        self._link_grace_tasks.clear()
+
+    async def _link_socket_event_handler(self, message):
+        """Track one Link's cloud socket and refresh features when it comes back."""
+        if self._closing:
+            return
+        for item in message.get("items") or []:
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            online = payload.get("online")
+            if online is not True and online is not False:
+                continue
+
+            link_id = payload.get("linkId")
+            if link_id is None:
+                link_id = link_id_from_combined_id(payload.get("deviceId"))
+            if link_id is None:
+                _LOGGER.warning("Link socket event missing linkId - payload: %s", payload)
+                continue
+            link_id = str(link_id)
+            if not self._accept_link_socket_generation(link_id, connected_since_ms(payload.get("connectedSince"))):
+                continue
+            if online is True:
+                self._note_link_online(link_id)
+            else:
+                self._note_link_offline(link_id)
+
+    def _accept_link_socket_generation(self, link_id, connected_since):
+        """False when this event is older than a socket generation already applied.
+
+        A missing generation cannot be ordered and is applied as it arrives.
+        """
+        if connected_since is None:
+            return True
+        newest = self._link_connected_since.get(link_id)
+        if newest is not None and connected_since < newest:
+            _LOGGER.debug(
+                "Link socket event ignored - older generation for linkId: %s (%s < %s)",
+                link_id, connected_since, newest,
+            )
+            return False
+        self._link_connected_since[link_id] = connected_since
+        return True
+
+    def _note_link_online(self, link_id):
+        """Rising edge into online. Heartbeats while already online do nothing."""
+        if self._closing:
+            return
+        state = self._link_socket_state.get(link_id)
+        if state == "online":
+            return
+
+        grace = self._link_grace_tasks.get(link_id)
+        if grace is not None and not grace.done():
+            grace.cancel()
+        if state in _LINK_STATUS_HELD:
+            self._link_status_epoch[link_id] = self._link_status_epoch.get(link_id, 0) + 1
+            self._link_restore_owed.add(link_id)
+            _LOGGER.debug("Link socket online - leaving %s for linkId: %s", state, link_id)
+        else:
+            _LOGGER.debug("Link socket online - refreshing features for linkId: %s", link_id)
+
+        self._link_socket_state[link_id] = "online"
+        self._link_feature_cycle_seen.discard(link_id)
+        self._arm_link_feature_refresh(link_id)
+        if state == "offline":
+            self._notify_hub_firmware_callbacks(link_id)
+
+    def _note_link_offline(self, link_id):
+        """Start the disconnect grace once. A waiting grace or an existing latch stays put."""
+        if self._closing:
+            return
+        grace = self._link_grace_tasks.get(link_id)
+        if self._link_socket_state.get(link_id) == "offline":
+            return
+        if grace is not None and not grace.done():
+            return
+
+        _LOGGER.debug("Link socket offline - grace for linkId: %s", link_id)
+        self._link_socket_state[link_id] = "grace"
+        self._link_refresh_ready_at.pop(link_id, None)
+        refresh = self._link_refresh_tasks.get(link_id)
+        if refresh is not None and not refresh.done():
+            refresh.cancel()
+        task = asyncio.create_task(self._disconnect_link_after_grace(link_id))
+        self._link_grace_tasks[link_id] = task
+        self._track_background(task)
+        task.add_done_callback(self._on_link_grace_done(link_id, task))
+
+    async def _disconnect_link_after_grace(self, link_id):
+        await asyncio.sleep(_LINK_OFFLINE_GRACE_SECS)
+        if self._closing or self._link_socket_state.get(link_id) != "grace":
+            return
+        self._link_status_epoch[link_id] = self._link_status_epoch.get(link_id, 0) + 1
+        self._link_socket_state[link_id] = "offline"
+        self._mark_link_devices_disconnected(link_id)
+        self._notify_hub_firmware_callbacks(link_id)
+        _LOGGER.debug("Link socket grace elapsed - disconnected linkId: %s", link_id)
+
+    def _on_link_grace_done(self, link_id, task):
+        def done(_task):
+            if self._link_grace_tasks.get(link_id) is task:
+                self._link_grace_tasks.pop(link_id, None)
+        return done
+
+    def _mark_link_devices_disconnected(self, link_id):
+        for device in self._devices_for_connection_status():
+            if link_id_from_combined_id(device.device_id) == link_id:
+                device.set_connection_status("disconnected")
+
+    def link_is_latched_offline(self, device_id):
+        """True after the disconnect grace has elapsed for this device's link."""
+        link_id = link_id_from_combined_id(device_id)
+        if not link_id:
+            return False
+        return self._link_socket_state.get(link_id) == "offline"
+
+    def _notify_hub_firmware_callbacks(self, link_id):
+        """The hub has no heartbeat status. Listeners still need the latch change."""
+        for device in self.devices.values():
+            try:
+                if not device.is_hub():
+                    continue
+            except Exception:
+                continue
+            if link_id_from_combined_id(device.device_id) != link_id:
+                continue
+            device._call_connection_status_callbacks()
+
+    def _link_status_held(self, link_id):
+        return bool(link_id) and self._link_socket_state.get(link_id) in _LINK_STATUS_HELD
+
+    def _arm_link_feature_refresh(self, link_id):
+        if self._closing:
+            return
+        link_id = str(link_id)
+        self._link_refresh_ready_at[link_id] = time.monotonic() + _LINK_REFRESH_DEBOUNCE_SECS
+        task = self._link_refresh_tasks.get(link_id)
+        if task is not None and not task.done():
+            return
+
+        task = asyncio.create_task(self._refresh_link_after_online(link_id))
+        self._link_refresh_tasks[link_id] = task
+        self._track_background(task)
+        task.add_done_callback(self._on_link_refresh_done(link_id, task))
+
+    def _features_for_link(self, link_id):
+        target = str(link_id)
+        return [
+            feature for feature in self.features.values()
+            if feature.can_read and link_id_from_combined_id(feature.id) == target
+        ]
+
+    async def _read_features(self, features, no_cache=False):
+        """Read features and return those whose items failed or never arrived."""
+        if not features:
+            return []
+
+        read_message = LW_WebsocketMessage("feature", "read")
+        id_map = {}
+        for feature in features:
+            payload = {"featureId": feature.id}
+            if no_cache:
+                payload["noCache"] = True
+            item_id = read_message.add_item(payload)
+            id_map[item_id] = feature
+
+        responses = await self._ws.async_sendmessage(read_message)
+        failed = []
+        seen = set()
+        for response in responses or []:
+            if not isinstance(response, dict):
+                continue
+            feature = id_map.get(response.get("itemId"))
+            if feature is None:
+                continue
+            seen.add(feature.id)
+            if response.get("success") is not True:
+                failed.append(feature)
+            try:
+                feature.process_feature_read(response)
+            except Exception as e:
+                _LOGGER.error(f"_read_features: Error processing message - response: {response} - {str(e)} - {traceback.format_exc()}")
+                if feature not in failed:
+                    failed.append(feature)
+        for feature in features:
+            if feature.id not in seen and feature not in failed:
+                failed.append(feature)
+        return failed
+
+    async def _refresh_link_after_online(self, link_id):
+        restore_task = None
+        saw_features = False
+        try:
+            # A cancel that arrives before the first await must still abort the read.
+            await asyncio.sleep(0)
+            if link_id in self._link_restore_owed and not self._closing:
+                restore_task = asyncio.create_task(self._restore_link_connection_status(link_id))
+                self._track_background(restore_task)
+
+            while True:
+                ready_at = self._link_refresh_ready_at.get(link_id)
+                if ready_at is None:
+                    break
+                delay = ready_at - time.monotonic()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+                    continue
+
+                self._link_refresh_ready_at.pop(link_id, None)
+                pending = None
+                for attempt in range(_LINK_REFRESH_ATTEMPTS):
+                    if link_id in self._link_refresh_ready_at:
+                        break
+
+                    if pending is None:
+                        features = self._features_for_link(link_id)
+                    else:
+                        features = pending
+                    if not features:
+                        _LOGGER.debug(f"_refresh_link_after_online: No readable features yet for linkId: {link_id}")
+                        if attempt + 1 < _LINK_REFRESH_ATTEMPTS:
+                            await asyncio.sleep(_LINK_REFRESH_RETRY_SECS)
+                            continue
+                        break
+
+                    saw_features = True
+                    try:
+                        failed = await self._read_features(features, no_cache=True)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        _LOGGER.exception(f"_refresh_link_after_online: feature read failed for linkId: {link_id}")
+                        failed = list(features)
+
+                    if not failed:
+                        _LOGGER.debug(f"_refresh_link_after_online: Refreshed {len(features)} features for linkId: {link_id}")
+                        break
+
+                    _LOGGER.debug(f"_refresh_link_after_online: {len(failed)} features unread for linkId: {link_id}")
+                    pending = failed
+                    if attempt + 1 < _LINK_REFRESH_ATTEMPTS:
+                        await asyncio.sleep(_LINK_REFRESH_RETRY_SECS)
+
+                if link_id not in self._link_refresh_ready_at:
+                    break
+
+            if saw_features and self._link_socket_state.get(link_id) == "online":
+                self._link_feature_cycle_seen.add(link_id)
+            if restore_task is not None:
+                await restore_task
+        except asyncio.CancelledError:
+            if restore_task is not None and not restore_task.done():
+                restore_task.cancel()
+                await asyncio.gather(restore_task, return_exceptions=True)
+            raise
+
+    def _on_link_refresh_done(self, link_id, task):
+        """Drop the mapping when the cycle ends, including a cancel before it starts."""
+        def done(_task):
+            if self._link_refresh_tasks.get(link_id) is task:
+                self._link_refresh_tasks.pop(link_id, None)
+            if (
+                not self._closing
+                and link_id in self._link_refresh_ready_at
+                and link_id not in self._link_refresh_tasks
+            ):
+                self._arm_link_feature_refresh(link_id)
+        return done
+
+    async def _restore_link_connection_status(self, link_id):
+        """Re-read status once the socket is online again. A failed attempt leaves the current status."""
+        for attempt in range(_LINK_REFRESH_ATTEMPTS):
+            if self._closing or self._link_socket_state.get(link_id) != "online":
+                return
+            devices = [
+                device for device in self._devices_for_connection_status()
+                if link_id_from_combined_id(device.device_id) == link_id
+            ]
+            if not devices:
+                return
+
+            try:
+                ok = await self._async_read_device_statuses(
+                    devices,
+                    clear_on_failure=False,
+                    on_send=lambda: self._link_restore_owed.discard(link_id),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                _LOGGER.exception(f"_restore_link_connection_status: status read failed for linkId: {link_id}")
+                ok = False
+            if ok:
+                return
+            if attempt + 1 < _LINK_REFRESH_ATTEMPTS:
+                await asyncio.sleep(_LINK_REFRESH_RETRY_SECS)
+
+    async def _device_status_event_handler(self, message):
+        """Apply a hub deviceStatus event. Payload is deviceId and status."""
+        items = message.get("items") or []
+        for item in items:
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if not isinstance(payload, dict):
+                continue
+            device_id = payload.get("deviceId")
+            device = self.devices.get(device_id)
+            if device is None or device.is_hub():
+                continue
+            link_id = link_id_from_combined_id(device.device_id)
+            if self._link_status_held(link_id):
+                continue
+            device.set_connection_status(payload.get("status"))
+
+    def _status_result_current(self, device, captured_epoch):
+        """False once this link was held or its epoch moved after the read was sent."""
+        link_id = link_id_from_combined_id(device.device_id)
+        if self._link_status_held(link_id):
+            return False
+        current = self._link_status_epoch.get(link_id, 0) if link_id else 0
+        return captured_epoch == current
+
+    def _apply_device_status_response(self, device, response, clear_on_failure=True):
+        """Store a deviceStatus.read item. A failed startup item clears the status."""
+        if not isinstance(response, dict) or response.get("success") is not True:
+            if response is not None:
+                _LOGGER.warning(f"deviceStatus.read failed for {device.device_id} - {response}")
+            if clear_on_failure:
+                device.set_connection_status(None)
+                return None
+            return device.connection_status
+        payload = response.get("payload") if isinstance(response.get("payload"), dict) else {}
+        return device.set_connection_status(payload.get("status"))
+
+    def _devices_for_connection_status(self):
+        """Gen2 devices whose online state comes from the hub heartbeat cache."""
+        devices = []
+        for device in self.devices.values():
+            try:
+                if device.is_gen2() and not device.is_hub():
+                    devices.append(device)
+            except Exception:
+                _LOGGER.debug(f"_devices_for_connection_status: skipped {getattr(device, 'device_id', None)}")
+        return devices
+
+    async def _async_read_device_statuses(self, devices=None, clear_on_failure=True, on_send=None):
+        """Read deviceStatus for gen2 devices. Each device keeps the epoch from send time."""
+        if devices is None:
+            devices = self._devices_for_connection_status()
+        if not devices:
+            return True
+
+        readmess = LW_WebsocketMessage("deviceStatus", "read")
+        id_map = {}
+        epochs = {}
+        for device in devices:
+            link_id = link_id_from_combined_id(device.device_id)
+            if self._link_status_held(link_id):
+                continue
+            item_id = readmess.add_item({"deviceId": device.device_id})
+            id_map[item_id] = device
+            epochs[device.device_id] = self._link_status_epoch.get(link_id, 0) if link_id else 0
+
+        if not id_map:
+            return True
+
+        if on_send is not None:
+            on_send()
+
+        try:
+            responses = await self._ws.async_sendmessage(readmess)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _LOGGER.warning(f"_async_read_device_statuses: {e}")
+            if clear_on_failure:
+                for device in id_map.values():
+                    if self._status_result_current(device, epochs[device.device_id]):
+                        device.set_connection_status(None)
+            return False
+
+        seen = set()
+        ok = True
+        for response in responses or []:
+            device = id_map.get(response.get("itemId")) if isinstance(response, dict) else None
+            if device is None:
+                continue
+            if not self._status_result_current(device, epochs[device.device_id]):
+                ok = False
+                continue
+            seen.add(device.device_id)
+            if response.get("success") is True:
+                self._apply_device_status_response(device, response, clear_on_failure=False)
+            else:
+                ok = False
+                self._apply_device_status_response(device, response, clear_on_failure=clear_on_failure)
+        for device in id_map.values():
+            if device.device_id in seen:
+                continue
+            if not self._status_result_current(device, epochs[device.device_id]):
+                ok = False
+                continue
+            ok = False
+            if clear_on_failure:
+                device.set_connection_status(None)
+        return ok
+
+    async def async_refresh_device_connection_status(self, device_id):
+        """Re-read one device before an install. A latched hub follows its socket."""
+        device = self.devices.get(device_id)
+        if device is None:
+            return None
+        if device.is_hub():
+            if not self.connected or self.link_is_latched_offline(device.device_id):
+                return None
+            return "connected"
+        link_id = link_id_from_combined_id(device.device_id)
+        if self._link_status_held(link_id):
+            return device.connection_status
+        await self._async_read_device_statuses([device], clear_on_failure=True)
+        return device.connection_status
+
     async def async_get_hierarchy(self):
         _LOGGER.debug("async_get_hierarchy: Reading hierarchy")
         
@@ -114,13 +602,31 @@ class LWLink2:
         _LOGGER.debug(f"async_get_hierarchy: Reading groups: {self._group_ids}")
         await self._async_read_groups()
 
-        task = asyncio.create_task(self.async_update_featureset_states())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        
-        task = asyncio.create_task(self._async_read_firmware())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._track_background(asyncio.create_task(self.async_update_featureset_states()))
+        self._track_background(asyncio.create_task(self._async_read_firmware()))
+        self._track_background(asyncio.create_task(self._async_read_device_statuses()))
+        self._track_background(asyncio.create_task(self._kick_online_link_feature_refreshes()))
+
+    async def _kick_online_link_feature_refreshes(self):
+        """One refresh for an online link whose earlier cycle ran before its features existed."""
+        if self._closing:
+            return
+        seen = set()
+        for feature in self.features.values():
+            if not feature.can_read:
+                continue
+            link_id = link_id_from_combined_id(feature.id)
+            if not link_id or link_id in seen:
+                continue
+            seen.add(link_id)
+            if self._link_socket_state.get(link_id) != "online":
+                continue
+            if link_id in self._link_feature_cycle_seen:
+                continue
+            task = self._link_refresh_tasks.get(link_id)
+            if task is not None and not task.done():
+                continue
+            self._arm_link_feature_refresh(link_id)
         
 
     def _room_names_by_featureset(self, hierarchy_payload):
@@ -357,6 +863,17 @@ class LWLink2:
         else:
             _LOGGER.warning(f"async_register_firmware_event_callback: Device not found: {device_id}")
 
+    async def async_register_connection_status_callback(self, device_id, callback):
+        if device_id in self.devices:
+            self.devices[device_id].register_connection_status_callback(callback)
+        else:
+            _LOGGER.warning(f"async_register_connection_status_callback: Device not found: {device_id}")
+
+    def unregister_connection_status_callback(self, device_id, callback):
+        device = self.devices.get(device_id)
+        if device is not None:
+            device.unregister_connection_status_callback(callback)
+
     @property
     def connected(self):
         """True while the websocket session is authenticated."""
@@ -382,6 +899,8 @@ class LWLink2:
         self._ws.async_force_reconnect(secs)
 
     async def async_deactivate(self, source="link-deactivate"):
+        self._closing = True
+        self._link_refresh_ready_at.clear()
         if self._background_tasks:
             _LOGGER.debug(f"async_deactivate ({source}): Cancelling {len(self._background_tasks)} LWLink2 background tasks")
             tasks_to_cancel = []
@@ -398,6 +917,8 @@ class LWLink2:
         await self._ws.async_deactivate(source)
         
     async def async_activate(self, max_tries=None, force_keep_alive_secs=0, source="link-activate", connect_callback=None):
+        self._closing = False
+        self._clear_link_socket_state()
         self._ws.activate(source=source)
         
         if connect_callback:

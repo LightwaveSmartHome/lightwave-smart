@@ -11,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
 
 MAX_PENDING_ITEMS = 2000
-CLIENT_ID_PREFIX = "7"
+CLIENT_ID_PREFIX = "8"
 TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
 
 

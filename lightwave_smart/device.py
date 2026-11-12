@@ -6,6 +6,9 @@ from .utils import get_highest_version
 _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
 
+# Hub heartbeat cache. Anything else is treated as not connected.
+CONNECTION_STATUSES = ("connected", "disconnected", "unknown")
+
 
 class LWRFDevice:
     
@@ -17,6 +20,7 @@ class LWRFDevice:
         self.featuresets = []
         self.featureIds = []
         self._firmware_event_callbacks = []
+        self._connection_status_callbacks = []
         
         self.product_code = None
         self.virtual_product_code = None
@@ -32,12 +36,21 @@ class LWRFDevice:
         
         self.firmware_update_in_progress = False
         self.room_name = None
+        self.connection_status = None
         
     @property
     def name(self):
         return " - ".join([featureset.name for featureset in self.featuresets])
 
     def is_hub(self): return self.product_code == "L2"
+
+    def firmware_update_allowed(self):
+        link = self.link
+        if link is None or not link.connected:
+            return False
+        if self.is_hub():
+            return not link.link_is_latched_offline(self.device_id)
+        return self.connection_status == "connected"
         
     def is_gen2(self): 
         if self.manufacturer_code == 'LightwaveRF':
@@ -50,6 +63,13 @@ class LWRFDevice:
         self.featuresets.append(new_featureset)
 
     async def update_firmware(self, version):
+        if not self.firmware_update_allowed():
+            _LOGGER.warning(
+                f"update_firmware: device {self.device_id} is not connected "
+                f"(status: {self.connection_status}), firmware update not sent"
+            )
+            return False
+
         if version != self.latest_firmware_version:
             _LOGGER.warning(f"update_firmware: Firmware version given '{version}' is not the latest version '{self.latest_firmware_version}', latest release version will be used, release id: {self._latest_firmware_release_id}")
         
@@ -69,6 +89,38 @@ class LWRFDevice:
     
     def register_firmware_event_callback(self, callback):
         self._firmware_event_callbacks.append(callback)
+
+    def register_connection_status_callback(self, callback):
+        if callback not in self._connection_status_callbacks:
+            self._connection_status_callbacks.append(callback)
+
+    def unregister_connection_status_callback(self, callback):
+        try:
+            self._connection_status_callbacks.remove(callback)
+        except ValueError:
+            return
+
+    def set_connection_status(self, status):
+        normalized = None
+        if isinstance(status, str):
+            lowered = status.strip().lower()
+            if lowered in CONNECTION_STATUSES:
+                normalized = lowered
+        if normalized == self.connection_status:
+            return self.connection_status
+        self.connection_status = normalized
+        self._call_connection_status_callbacks()
+        return self.connection_status
+
+    async def async_refresh_connection_status(self):
+        if self.link is None:
+            self.set_connection_status(None)
+            return None
+        if self.is_hub():
+            if not self.link.connected or self.link.link_is_latched_offline(self.device_id):
+                return None
+            return "connected"
+        return await self.link.async_refresh_device_connection_status(self.device_id)
         
     def _call_firmware_event_callbacks(self):
         for callback in self._firmware_event_callbacks:
@@ -76,6 +128,13 @@ class LWRFDevice:
                 callback(device_id = self.device_id)
             except Exception as exp:
                 _LOGGER.error(f"_call_firmware_event_callbacks - callback: {callback.__name__} - error: {str(exp)}")
+
+    def _call_connection_status_callbacks(self):
+        for callback in self._connection_status_callbacks:
+            try:
+                callback(device_id = self.device_id)
+            except Exception as exp:
+                _LOGGER.error(f"_call_connection_status_callbacks - callback: {callback.__name__} - error: {str(exp)}")
 
     def update_firmware_in_progress(self, state):
         self.firmware_update_in_progress = state

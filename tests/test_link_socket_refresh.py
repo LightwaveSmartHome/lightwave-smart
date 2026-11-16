@@ -1,8 +1,11 @@
 import asyncio
+from datetime import datetime, timezone
+import json
 import unittest
 
+import aiohttp
 import lightwave_smart.link as link_mod
-from lightwave_smart.device import LWRFFeature
+from lightwave_smart.device import LWRFDevice, LWRFFeature, LWRFFeatureSet
 from lightwave_smart.link import LWLink2, link_id_from_combined_id
 
 
@@ -244,3 +247,162 @@ class LinkSocketRefreshTests(unittest.IsolatedAsyncioTestCase):
         task = next(iter(link._link_refresh_tasks.values()))
         self.assertFalse(task.done())
         await link.async_deactivate()
+
+
+class LinkLastEventTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self._orig_utc_now = link_mod._utc_now
+        self._debounce = link_mod._LINK_REFRESH_DEBOUNCE_SECS
+        self._grace = link_mod._LINK_OFFLINE_GRACE_SECS
+        link_mod._LINK_REFRESH_DEBOUNCE_SECS = 0
+        link_mod._LINK_OFFLINE_GRACE_SECS = 0
+
+    def tearDown(self):
+        link_mod._utc_now = self._orig_utc_now
+        link_mod._LINK_REFRESH_DEBOUNCE_SECS = self._debounce
+        link_mod._LINK_OFFLINE_GRACE_SECS = self._grace
+
+    def _two_hub_link(self):
+        link = LWLink2()
+
+        hub1_dev = LWRFDevice()
+        hub1_dev.link = link
+        hub1_dev.device_id = "s1-1-99+0"
+        hub1_dev.product_code = "L2"
+        hub1_fs = LWRFFeatureSet()
+        hub1_fs.link = link
+        hub1_fs.featureset_id = "s1-hubgrp"
+        hub1_fs.device = hub1_dev
+        hub1_dev.add_featureset(hub1_fs)
+
+        hub2_dev = LWRFDevice()
+        hub2_dev.link = link
+        hub2_dev.device_id = "s2-1-50+0"
+        hub2_dev.product_code = "L2"
+        hub2_fs = LWRFFeatureSet()
+        hub2_fs.link = link
+        hub2_fs.featureset_id = "s2-hubgrp"
+        hub2_fs.device = hub2_dev
+        hub2_dev.add_featureset(hub2_fs)
+
+        link.devices = {hub1_dev.device_id: hub1_dev, hub2_dev.device_id: hub2_dev}
+        link.featuresets = {hub1_fs.featureset_id: hub1_fs, hub2_fs.featureset_id: hub2_fs}
+        link.set_structure_data(hub1_dev.device_id, hub1_fs.featureset_id, "Home")
+        link.set_structure_data(hub2_dev.device_id, hub2_fs.featureset_id, "Outbuilding")
+
+        feat1 = _feature("s1-10-99+2")
+        feat2 = _feature("s2-11-50+0")
+        link.features = {feat1.id: feat1, feat2.id: feat2}
+        return link, hub1_fs.featureset_id, hub2_fs.featureset_id
+
+    async def test_feature_and_device_status_events_stamp_only_matching_hub(self):
+        link, hub1_fs_id, hub2_fs_id = self._two_hub_link()
+        self.assertIsNone(link.get_link_last_event(hub1_fs_id))
+        self.assertIsNone(link.get_link_last_event(hub2_fs_id))
+
+        t1 = datetime(2026, 11, 14, 18, 0, 0, tzinfo=timezone.utc)
+        link_mod._utc_now = lambda: t1
+        await link._feature_event_handler({
+            "items": [{"payload": {"featureId": "s1-10-99+2", "value": 1}}]
+        })
+        self.assertEqual(link.get_link_last_event(hub1_fs_id), t1)
+        self.assertIsNone(link.get_link_last_event(hub2_fs_id))
+
+        t2 = datetime(2026, 11, 14, 18, 1, 0, tzinfo=timezone.utc)
+        link_mod._utc_now = lambda: t2
+        await link._device_status_event_handler({
+            "items": [{"payload": {"deviceId": "s2-4-50+0", "status": "connected"}}]
+        })
+        self.assertEqual(link.get_link_last_event(hub1_fs_id), t1)
+        self.assertEqual(link.get_link_last_event(hub2_fs_id), t2)
+
+    async def test_repeat_online_heartbeat_advances_time_while_stale_and_offline_do_not(self):
+        link, hub1_fs_id, _hub2_fs_id = self._two_hub_link()
+
+        async def send(message, redact=False, immediate=False):
+            return [{
+                "itemId": item["itemId"],
+                "success": True,
+                "payload": {"value": 0},
+            } for item in message.get_items()]
+
+        link._ws.async_sendmessage = send
+
+        t1 = datetime(2026, 11, 14, 18, 10, 0, tzinfo=timezone.utc)
+        link_mod._utc_now = lambda: t1
+        await link._link_socket_event_handler({
+            "items": [{"payload": {"linkId": 99, "online": True, "connectedSince": 5000}}]
+        })
+        await next(iter(link._link_refresh_tasks.values()))
+        self.assertEqual(link.get_link_last_event(hub1_fs_id), t1)
+
+        # Repeat online heartbeat while already online moves last_event.
+        t2 = datetime(2026, 11, 14, 18, 15, 0, tzinfo=timezone.utc)
+        link_mod._utc_now = lambda: t2
+        await link._link_socket_event_handler({
+            "items": [{"payload": {"linkId": 99, "online": True, "connectedSince": 5000}}]
+        })
+        self.assertEqual(link.get_link_last_event(hub1_fs_id), t2)
+
+        # Older connectedSince generation does not move last_event.
+        t3 = datetime(2026, 11, 14, 18, 20, 0, tzinfo=timezone.utc)
+        link_mod._utc_now = lambda: t3
+        await link._link_socket_event_handler({
+            "items": [{"payload": {"linkId": 99, "online": True, "connectedSince": 4000}}]
+        })
+        self.assertEqual(link.get_link_last_event(hub1_fs_id), t2)
+
+        # Offline notice from server does not move last_event.
+        await link._link_socket_event_handler({
+            "items": [{"payload": {"linkId": 99, "online": False, "connectedSince": 6000}}]
+        })
+        await next(iter(link._link_grace_tasks.values()))
+        self.assertEqual(link.get_link_last_event(hub1_fs_id), t2)
+
+        # Reconnect socket-state reset keeps last_event until a fresh notification arrives.
+        link._clear_link_socket_state()
+        self.assertEqual(link.get_link_last_event(hub1_fs_id), t2)
+
+    async def test_responses_do_not_set_last_event_in_consumer(self):
+        link, hub1_fs_id, _hub2_fs_id = self._two_hub_link()
+
+        class FakeSocket:
+            def __init__(self, frames):
+                self._frames = list(frames)
+
+            async def receive(self):
+                if self._frames:
+                    return self._frames.pop(0)
+                link._ws._active = False
+                return aiohttp.WSMessage(aiohttp.WSMsgType.TEXT, json.dumps({
+                    "version": 1,
+                    "transactionId": 999,
+                    "direction": "response",
+                    "class": "feature",
+                    "operation": "write",
+                    "items": [],
+                }), None)
+
+        response_frame = aiohttp.WSMessage(
+            aiohttp.WSMsgType.TEXT,
+            json.dumps({
+                "version": 1,
+                "transactionId": 1,
+                "direction": "response",
+                "class": "feature",
+                "operation": "write",
+                "items": [{
+                    "itemId": 77,
+                    "success": True,
+                    "payload": {"featureId": "s1-10-99+2", "value": 1},
+                }],
+            }),
+            None,
+        )
+
+        link._ws._active = True
+        link._ws._websocket = FakeSocket([response_frame])
+        await link._ws._consumer_handler()
+
+        self.assertIsNone(link.get_link_last_event(hub1_fs_id))
+

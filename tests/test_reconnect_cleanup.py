@@ -34,3 +34,56 @@ class CompleteAndCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(websocket._pending_items_manager.count, 0)
         self.assertTrue(message._waitflag.is_set())
         self.assertTrue(websocket._transaction_queue.empty())
+
+
+class ReconnectCallbackPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_callbacks_survive_deactivate_and_reactivate_without_duplication(self):
+        websocket = LWWebsocket(None)
+        events = []
+
+        async def hierarchy_cb():
+            events.append("hierarchy")
+
+        def cloud_link_connect():
+            events.append("connect")
+
+        def cloud_link_disconnect():
+            events.append("disconnect")
+
+        websocket.register_connect_callback(hierarchy_cb)
+        websocket.register_connect_callback(cloud_link_connect)
+        websocket.register_disconnect_callback(cloud_link_disconnect)
+
+        websocket.activate(source="initial")
+        websocket._authenticated = True
+        await websocket._notify_connect()
+        self.assertEqual(events, ["hierarchy", "connect"])
+        events.clear()
+
+        # Intentional deactivate suppresses disconnect notifications and preserves callbacks.
+        await websocket.async_deactivate(source="service_handle_reconnect")
+        await websocket._notify_disconnect()
+        self.assertEqual(events, [])
+
+        # Re-activating and passing connect_callback again must not duplicate hierarchy_cb.
+        websocket.activate(source="service_handle_reconnect")
+        websocket.register_connect_callback(hierarchy_cb)
+        websocket._authenticated = True
+        await websocket._notify_connect()
+        self.assertEqual(events, ["hierarchy", "connect"])
+        events.clear()
+
+        # Subsequent unintentional drop notifies disconnect listeners.
+        await websocket._notify_disconnect()
+        self.assertEqual(events, ["disconnect"])
+        events.clear()
+
+        websocket.unregister_connect_callback(cloud_link_connect)
+        websocket.unregister_disconnect_callback(cloud_link_disconnect)
+        websocket._authenticated = True
+        await websocket._notify_connect()
+        await websocket._notify_disconnect()
+        self.assertEqual(events, ["hierarchy"])
+
+        await websocket.async_deactivate(source="cleanup")
+

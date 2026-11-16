@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timezone
 import logging
 import time
 import traceback
@@ -50,6 +51,10 @@ def link_id_from_combined_id(combined_id):
     link_id = parts[2].split("+", 1)[0]
     return link_id or None
 
+
+def _utc_now():
+    return datetime.now(timezone.utc)
+
 class LWLink2:
     def __init__(self, device_id=None, auth=None, client_version=None):
         self.auth = auth if auth else LWAuth()
@@ -73,6 +78,7 @@ class LWLink2:
         self._link_socket_state = {}
         self._link_status_epoch = {}
         self._link_connected_since = {}
+        self._link_last_event_at = {}
         self._link_restore_owed = set()
         self._link_feature_cycle_seen = set()
 
@@ -90,9 +96,12 @@ class LWLink2:
         
         items = message["items"]
         for item in items:
-            if "featureId" in item["payload"]:
-                feature_id = item["payload"]["featureId"]
-                value = item["payload"]["value"]
+            payload = item.get("payload") if isinstance(item, dict) else None
+            if isinstance(payload, dict):
+                self._note_link_event_from_payload(payload)
+            if isinstance(payload, dict) and "featureId" in payload:
+                feature_id = payload["featureId"]
+                value = payload["value"]
 
                 # feature = self.get_feature_by_featureid(feature_id)
                 feature = None
@@ -124,7 +133,8 @@ class LWLink2:
 
     async def _firmware_event_handler_started(self, message):
         _LOGGER.debug("_firmware_event_handler_started: Event received - message: %s ", message)
-        if "deviceId" in message["payload"]:    
+        self._stamp_event_message(message)
+        if "payload" in message and "deviceId" in message["payload"]:    
             device_id = message["payload"]["deviceId"]
             if device_id in self.devices:
                 device = self.devices[device_id]
@@ -132,7 +142,8 @@ class LWLink2:
 
     async def _firmware_event_handler_complete(self, message):
         _LOGGER.debug("_firmware_event_handler_complete: Event received - message: %s ", message)
-        if "deviceId" in message["payload"]:    
+        self._stamp_event_message(message)
+        if "payload" in message and "deviceId" in message["payload"]:    
             device_id = message["payload"]["deviceId"]
             if device_id in self.devices:
                 device = self.devices[device_id]
@@ -141,6 +152,74 @@ class LWLink2:
                     device.firmware_version = message["payload"]["firmwareVersion"]
                     
                 device.update_firmware_in_progress(False)
+
+    def _resolve_link_id(self, thing_id):
+        """Resolve a combined id, featureset id, structure id, or link id to linkId."""
+        if thing_id is None or isinstance(thing_id, bool):
+            return None
+        link_id = link_id_from_combined_id(thing_id)
+        if link_id:
+            return link_id
+
+        key = str(thing_id).strip()
+        if not key:
+            return None
+
+        candidates = (
+            getattr(self.featuresets.get(key), "device", None),
+            self.devices.get(key),
+            getattr(self.featuresets.get(self.get_linkPlus_featureset_id(key) or ""), "device", None),
+        )
+        for device in candidates:
+            link_id = link_id_from_combined_id(getattr(device, "device_id", None))
+            if link_id:
+                return link_id
+
+        if "-" not in key and key in self._link_last_event_at:
+            return key
+        return None
+
+    def _note_link_event(self, link_id):
+        """Record when an inbound notification event was last received for link_id."""
+        if link_id is None or isinstance(link_id, bool):
+            return
+        text = str(link_id).strip()
+        if not text:
+            return
+        self._link_last_event_at[text] = _utc_now()
+
+    def _note_link_event_from_payload(self, payload):
+        if not isinstance(payload, dict):
+            return
+        raw_link_id = payload.get("linkId")
+        if raw_link_id is not None and not isinstance(raw_link_id, bool):
+            text = str(raw_link_id).strip()
+            if text:
+                self._note_link_event(text)
+                return
+        for key in ("featureId", "deviceId", "groupId"):
+            resolved = self._resolve_link_id(payload.get(key))
+            if resolved:
+                self._note_link_event(resolved)
+                return
+
+    def _stamp_event_message(self, message):
+        if not isinstance(message, dict):
+            return
+        items = message.get("items")
+        if isinstance(items, list):
+            for item in items:
+                if isinstance(item, dict):
+                    self._note_link_event_from_payload(item.get("payload"))
+        if isinstance(message.get("payload"), dict):
+            self._note_link_event_from_payload(message.get("payload"))
+
+    def get_link_last_event(self, thing_id):
+        """Return the UTC datetime of the last inbound notification for thing_id's hub."""
+        link_id = self._resolve_link_id(thing_id)
+        if not link_id:
+            return None
+        return self._link_last_event_at.get(link_id)
 
     def _track_background(self, task):
         self._background_tasks.add(task)
@@ -181,6 +260,7 @@ class LWLink2:
             if not self._accept_link_socket_generation(link_id, connected_since_ms(payload.get("connectedSince"))):
                 continue
             if online is True:
+                self._note_link_event(link_id)
                 self._note_link_online(link_id)
             else:
                 self._note_link_offline(link_id)
@@ -463,6 +543,7 @@ class LWLink2:
             payload = item.get("payload") if isinstance(item, dict) else None
             if not isinstance(payload, dict):
                 continue
+            self._note_link_event_from_payload(payload)
             device_id = payload.get("deviceId")
             device = self.devices.get(device_id)
             if device is None or device.is_hub():
@@ -580,7 +661,9 @@ class LWLink2:
         await self._async_read_device_statuses([device], clear_on_failure=True)
         return device.connection_status
 
-    async def async_get_hierarchy(self):
+    async def async_get_hierarchy(self, message=None):
+        if isinstance(message, dict):
+            self._stamp_event_message(message)
         _LOGGER.debug("async_get_hierarchy: Reading hierarchy")
         
         readmess = LW_WebsocketMessage("user", "rootGroups")

@@ -399,8 +399,6 @@ class LWWebsocket:
         self._authenticated = False
         self._active = None
         await self.clean_up()
-        self._connect_callbacks = []
-        self._disconnect_callbacks = []
         
         tasks_to_cancel = []
         while self.background_tasks:

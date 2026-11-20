@@ -194,7 +194,7 @@ class DeviceConnectionStatusTests(unittest.IsolatedAsyncioTestCase):
 
         await next(iter(self.link._link_grace_tasks.values()))
 
-        self.assertEqual(own.connection_status, "disconnected")
+        self.assertEqual(own.connection_status, "unknown")
         self.assertEqual(other.connection_status, "connected")
         self.assertIsNone(hub.connection_status)
         self.assertEqual(self.link._link_socket_state.get("99"), "offline")
@@ -241,12 +241,12 @@ class DeviceConnectionStatusTests(unittest.IsolatedAsyncioTestCase):
             "items": [{"payload": {"linkId": 99, "online": False}}]
         })
         await next(iter(self.link._link_grace_tasks.values()))
-        self.assertEqual(own.connection_status, "disconnected")
+        self.assertEqual(own.connection_status, "unknown")
 
         release.set()
         await read
 
-        self.assertEqual(own.connection_status, "disconnected")
+        self.assertEqual(own.connection_status, "unknown")
         self.assertEqual(other.connection_status, "connected")
 
     async def test_activate_clears_a_latch_so_the_next_read_applies(self):
@@ -354,7 +354,7 @@ class DeviceConnectionStatusTests(unittest.IsolatedAsyncioTestCase):
         })
         await next(iter(self.link._link_grace_tasks.values()))
 
-        self.assertEqual(device.connection_status, "disconnected")
+        self.assertEqual(device.connection_status, "unknown")
         self.assertEqual(self.link._link_socket_state.get("99"), "offline")
         await self.link.async_deactivate()
 
@@ -371,7 +371,7 @@ class DeviceConnectionStatusTests(unittest.IsolatedAsyncioTestCase):
         })
         await next(iter(self.link._link_grace_tasks.values()))
 
-        self.assertEqual(device.connection_status, "disconnected")
+        self.assertEqual(device.connection_status, "unknown")
         await self.link.async_deactivate()
 
     async def test_status_is_frozen_during_grace_and_reread_when_it_ends(self):
@@ -462,6 +462,83 @@ class DeviceConnectionStatusTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(hub.firmware_update_allowed())
         self.assertEqual(seen, [hub.device_id, hub.device_id])
         await self.link.async_deactivate()
+
+    async def test_latch_sets_unknown_and_restore_reports_disconnected(self):
+        device = _switch(self.link, "struct-1-99+1")
+        device.set_connection_status("disconnected")
+        seen = []
+        device.register_connection_status_callback(
+            lambda **kwargs: seen.append(device.connection_status)
+        )
+        link_mod._LINK_OFFLINE_GRACE_SECS = 0
+        link_mod._LINK_REFRESH_DEBOUNCE_SECS = 0
+        link_mod._LINK_REFRESH_RETRY_SECS = 0
+
+        async def send(message, redact=False, immediate=False):
+            if message.opclass != "deviceStatus":
+                return []
+            return [{
+                "success": True,
+                "itemId": item["itemId"],
+                "payload": {"status": "disconnected"},
+            } for item in message.get_items()]
+
+        self.link._ws.async_sendmessage = send
+        try:
+            await self.link._link_socket_event_handler({
+                "items": [{"payload": {"linkId": "99", "online": False}}]
+            })
+            await next(iter(self.link._link_grace_tasks.values()))
+            self.assertEqual(device.connection_status, "unknown")
+            self.assertEqual(seen, ["unknown"])
+
+            await self.link._link_socket_event_handler({
+                "items": [{"payload": {"linkId": "99", "online": True, "connectedSince": 5}}]
+            })
+            await next(iter(self.link._link_refresh_tasks.values()))
+
+            self.assertEqual(device.connection_status, "disconnected")
+            self.assertEqual(seen, ["unknown", "disconnected"])
+        finally:
+            link_mod._LINK_REFRESH_DEBOUNCE_SECS = 2
+            link_mod._LINK_REFRESH_RETRY_SECS = 5
+            await self.link.async_deactivate()
+
+    async def test_failed_restore_leaves_unknown(self):
+        device = _switch(self.link, "struct-1-99+1")
+        device.set_connection_status("connected")
+        link_mod._LINK_OFFLINE_GRACE_SECS = 0
+        link_mod._LINK_REFRESH_DEBOUNCE_SECS = 0
+        link_mod._LINK_REFRESH_RETRY_SECS = 0
+
+        async def send(message, redact=False, immediate=False):
+            if message.opclass != "deviceStatus":
+                return []
+            return [{
+                "success": False,
+                "itemId": item["itemId"],
+                "error": {"message": "down"},
+            } for item in message.get_items()]
+
+        self.link._ws.async_sendmessage = send
+        try:
+            await self.link._link_socket_event_handler({
+                "items": [{"payload": {"linkId": "99", "online": False}}]
+            })
+            await next(iter(self.link._link_grace_tasks.values()))
+            self.assertEqual(device.connection_status, "unknown")
+
+            await self.link._link_socket_event_handler({
+                "items": [{"payload": {"linkId": "99", "online": True, "connectedSince": 5}}]
+            })
+            await next(iter(self.link._link_refresh_tasks.values()))
+
+            self.assertEqual(device.connection_status, "unknown")
+            self.assertFalse(device.firmware_update_allowed())
+        finally:
+            link_mod._LINK_REFRESH_DEBOUNCE_SECS = 2
+            link_mod._LINK_REFRESH_RETRY_SECS = 5
+            await self.link.async_deactivate()
 
 
 if __name__ == "__main__":

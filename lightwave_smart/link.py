@@ -338,9 +338,9 @@ class LWLink2:
             return
         self._link_status_epoch[link_id] = self._link_status_epoch.get(link_id, 0) + 1
         self._link_socket_state[link_id] = "offline"
-        self._mark_link_devices_disconnected(link_id)
+        self._mark_link_devices_unknown(link_id)
         self._notify_hub_firmware_callbacks(link_id)
-        _LOGGER.debug("Link socket grace elapsed - disconnected linkId: %s", link_id)
+        _LOGGER.debug("Link socket grace elapsed - hub websocket latched offline for linkId: %s", link_id)
 
     def _on_link_grace_done(self, link_id, task):
         def done(_task):
@@ -348,10 +348,11 @@ class LWLink2:
                 self._link_grace_tasks.pop(link_id, None)
         return done
 
-    def _mark_link_devices_disconnected(self, link_id):
+    def _mark_link_devices_unknown(self, link_id):
+        """The hub websocket dropped. Endpoint radios were not reported, so the last status is no longer known."""
         for device in self._devices_for_connection_status():
             if link_id_from_combined_id(device.device_id) == link_id:
-                device.set_connection_status("disconnected")
+                device.set_connection_status("unknown")
 
     def link_is_latched_offline(self, device_id):
         """True after the disconnect grace has elapsed for this device's link."""

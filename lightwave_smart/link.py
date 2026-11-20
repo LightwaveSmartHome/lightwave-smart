@@ -81,7 +81,9 @@ class LWLink2:
         self._link_last_event_at = {}
         self._link_restore_owed = set()
         self._link_feature_cycle_seen = set()
+        self._feature_read_outage_logged = set()
 
+        self._ws.register_connect_callback(self.clear_transient_feature_read_outage)
         self._ws.register_event_handler("feature", self._feature_event_handler)
         self._ws.register_event_handler("group", self.async_get_hierarchy)
         # self._ws.register_event_handler("device", self.async_get_hierarchy)
@@ -233,6 +235,7 @@ class LWLink2:
         self._link_restore_owed.clear()
         self._link_feature_cycle_seen.clear()
         self._link_refresh_ready_at.clear()
+        self.clear_transient_feature_read_outage()
         for task in list(self._link_grace_tasks.values()):
             if not task.done():
                 task.cancel()
@@ -289,6 +292,8 @@ class LWLink2:
         state = self._link_socket_state.get(link_id)
         if state == "online":
             return
+
+        self.clear_transient_feature_read_outage(link_id)
 
         grace = self._link_grace_tasks.get(link_id)
         if grace is not None and not grace.done():
@@ -961,6 +966,29 @@ class LWLink2:
     def connected(self):
         """True while the websocket session is authenticated."""
         return self._ws.connected
+
+    def note_transient_feature_read_failure(self, feature_id):
+        link_id = link_id_from_combined_id(feature_id)
+        label = link_id if link_id is not None else "unknown"
+        if link_id in self._feature_read_outage_logged:
+            _LOGGER.debug(
+                "Feature read failed while the Lightwave channel is down for link %s: %s",
+                label,
+                feature_id,
+            )
+            return
+        self._feature_read_outage_logged.add(link_id)
+        _LOGGER.warning(
+            "Feature reads failing while the Lightwave channel is down for link %s, feature %s",
+            label,
+            feature_id,
+        )
+
+    def clear_transient_feature_read_outage(self, link_id=None):
+        if link_id is None:
+            self._feature_read_outage_logged.clear()
+            return
+        self._feature_read_outage_logged.discard(str(link_id))
 
     def register_connect_callback(self, callback):
         self._ws.register_connect_callback(callback)

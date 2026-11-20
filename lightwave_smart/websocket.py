@@ -11,7 +11,7 @@ _LOGGER = logging.getLogger(__name__)
 # _LOGGER.setLevel(logging.INFO)
 
 MAX_PENDING_ITEMS = 2000
-CLIENT_ID_PREFIX = "8"
+CLIENT_ID_PREFIX = "9"
 TRANS_SERVER = "wss://v1-linkplus-app.lightwaverf.com"
 
 
@@ -167,7 +167,8 @@ class LWWebsocket:
                     _LOGGER.debug(f"{logPre} - MAX:  TIMEOUT - pending items: {self._pending_items_manager.count}")
                     
                 except asyncio.CancelledError:
-                    _LOGGER.warning(f"{logPre} - MAX:  Wait cancelled")
+                    _LOGGER.debug(f"{logPre} - MAX:  Wait cancelled")
+                    raise
                 
                 except Exception as exp:
                     _LOGGER.error(f"{logPre} - MAX:  ERROR - {str(exp)}")
@@ -188,12 +189,8 @@ class LWWebsocket:
                 continue
             
             except asyncio.CancelledError:
-                _LOGGER.warning(f"{logPre}:  Task cancelled - active: {self._active}")
-                if message and self._active:
-                    # If a message was retrieved before cancellation, put it back in the queue
-                    await self._transaction_queue.put(message)
-                message = None
-                continue
+                _LOGGER.debug(f"{logPre}:  Task cancelled - active: {self._active}")
+                raise
             
             except Exception as exp:
                 _LOGGER.error(f"{logPre}:  Unhandled exception: {str(exp)}")
@@ -210,7 +207,8 @@ class LWWebsocket:
             try:
                 await asyncio.sleep(0.01)
             except asyncio.CancelledError:
-                _LOGGER.warning(f"{logPre}:  Sleep cancelled")
+                _LOGGER.debug(f"{logPre}:  Sleep cancelled")
+                raise
                 
         _LOGGER.debug(f"{logPre}: Ending")                
 
@@ -440,10 +438,18 @@ class LWWebsocket:
 
     def _on_background_task_done(self, task):
         self.background_tasks.discard(task)
-        if task.cancelled() or not self._active:
+        if not self._active:
             return
 
         name = task.get_name()
+        if task.cancelled():
+            if name == "transaction_queue":
+                _LOGGER.warning(
+                    f"transaction_queue ({id(self)}) cancelled while active - restarting"
+                )
+                self._start_background_task(self._process_transaction_queue, "transaction_queue")
+            return
+
         exc = task.exception()
         _LOGGER.error(
             f"background task {name} ({id(self)}) exited while active - exception: {exc!r}"

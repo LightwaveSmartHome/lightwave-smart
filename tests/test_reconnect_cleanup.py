@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 
 from lightwave_smart.message import LW_WebsocketMessage
@@ -85,5 +86,50 @@ class ReconnectCallbackPersistenceTests(unittest.IsolatedAsyncioTestCase):
         await websocket._notify_disconnect()
         self.assertEqual(events, ["hierarchy"])
 
+        await websocket.async_deactivate(source="cleanup")
+
+
+class TransactionQueueCancelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deactivate_finishes_the_transaction_queue(self):
+        websocket = LWWebsocket(None)
+        websocket.activate(source="test")
+        await websocket.async_deactivate(source="test")
+        await asyncio.sleep(0)
+        self.assertFalse(websocket._active)
+        self.assertEqual(websocket.background_tasks, set())
+
+    async def test_cancel_while_active_restarts_the_transaction_queue(self):
+        websocket = LWWebsocket(None)
+        websocket.activate(source="test")
+        task = next(
+            item for item in websocket.background_tasks
+            if item.get_name() == "transaction_queue"
+        )
+        sent = []
+
+        async def fake_send(message):
+            sent.append(message)
+
+        websocket._send_message_to_websocket = fake_send
+        task.cancel()
+        _, pending = await asyncio.wait({task}, timeout=1)
+        self.assertEqual(pending, set())
+        self.assertTrue(task.cancelled())
+
+        await asyncio.sleep(0)
+        replacement = next(
+            item for item in websocket.background_tasks
+            if item.get_name() == "transaction_queue"
+        )
+        self.assertIsNot(replacement, task)
+        self.assertFalse(replacement.done())
+
+        message = LW_WebsocketMessage("feature", "read")
+        await websocket._transaction_queue.put(message)
+        for _ in range(50):
+            if sent:
+                break
+            await asyncio.sleep(0.01)
+        self.assertEqual(sent, [message])
         await websocket.async_deactivate(source="cleanup")
 

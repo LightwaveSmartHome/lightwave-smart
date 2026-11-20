@@ -9,6 +9,23 @@ _LOGGER = logging.getLogger(__name__)
 # Hub heartbeat cache. Anything else is treated as not connected.
 CONNECTION_STATUSES = ("connected", "disconnected", "unknown")
 
+_TRANSIENT_CHANNEL_MESSAGES = (
+    "destination not connected",
+    "Channel was closed",
+    "hookManager: Disconnected",
+)
+
+
+def _transient_channel_failure(response):
+    """True when a feature read failed because the channel dropped."""
+    error = response.get("error") if isinstance(response, dict) else None
+    if not isinstance(error, dict):
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    return any(part in message for part in _TRANSIENT_CHANNEL_MESSAGES)
+
 
 class LWRFDevice:
     
@@ -322,6 +339,8 @@ class LWRFFeature:
         if response["success"] == True:
             state = response["payload"]["value"]
             self.update_feature_state(state)
+        elif _transient_channel_failure(response) and self.link is not None:
+            self.link.note_transient_feature_read_failure(self.id)
         else:
             _LOGGER.warning(f"process_feature_read: failed to read feature: {self.id}  returned {response}")
         
